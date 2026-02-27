@@ -1,0 +1,7 @@
+bin/
+lib/
+obj/
+.ipynb_checkpoints/
+**/__pycache__
+*.pyc
+*.csv
