@@ -235,16 +235,18 @@ def count_grid_capacity(mask_chunk, spacing_px, grid_type_code):
 #           CORE PIPELINE HELPERS
 # ==========================================
 
-def load_dem_and_init_buffers(dem_path, temp_dir):
+def load_dem_and_init_buffers(dem_path, temp_dir, resume=False, resume_dir=None):
     """
     Step 1 Pipeline: Converts TIF to memory-mapped NPY for rapid random access
     and initializes the ping-pong buffers for later morphology steps.
+    If resume is True and resume_dir is provided, it attempts to load an existing ray-tracing buffer.
     
     Returns:
     - elevation (ndarray): Memory mapped DEM.
     - rows, cols (int): Array dimensions.
     - path_A, path_B (str): Paths to the initialized boolean buffer arrays.
-    - buf_a (ndarray): Open memory map of Buffer A in write mode.
+    - buf_a (ndarray): Open memory map of Buffer A.
+    - is_resuming (bool): True if successfully loaded a previous physics buffer.
     """
     npy_path = dem_path.replace(".tif", ".npy")
     if not os.path.exists(npy_path):
@@ -257,11 +259,24 @@ def load_dem_and_init_buffers(dem_path, temp_dir):
     
     path_A = os.path.join(temp_dir, "buffer_A.npy")
     path_B = os.path.join(temp_dir, "buffer_B.npy")
-    buf_a = np.lib.format.open_memmap(path_A, mode='w+', shape=(rows, cols), dtype=bool)
+    
+    is_resuming = False
+    if resume and resume_dir and os.path.exists(os.path.join(resume_dir, "buffer_A.npy")):
+        src_buffer = os.path.join(resume_dir, "buffer_A.npy")
+        if os.path.abspath(src_buffer) != os.path.abspath(path_A):
+            print(f"      -> Resuming: Copying existing physics buffer from {src_buffer}...")
+            shutil.copy(src_buffer, path_A)
+        else:
+            print(f"      -> Resuming: Using existing physics buffer at {src_buffer}...")
+        buf_a = np.lib.format.open_memmap(path_A, mode='r+', shape=(rows, cols), dtype=bool)
+        is_resuming = True
+    else:
+        buf_a = np.lib.format.open_memmap(path_A, mode='w+', shape=(rows, cols), dtype=bool)
+        
     buf_b = np.lib.format.open_memmap(path_B, mode='w+', shape=(rows, cols), dtype=bool)
     del buf_b # Release lock immediately; only keep file on disk
     
-    return elevation, rows, cols, path_A, path_B, buf_a
+    return elevation, rows, cols, path_A, path_B, buf_a, is_resuming
 
 def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
                            min_alt=None, max_alt=None, min_aspect_deg=None, max_aspect_deg=None, 
@@ -771,6 +786,7 @@ Customizable Constraints & Processing Parameters:
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
 - Downsample Factor: Modifies the internal resolution of the capacity masking, speeding up processing.
 - Tile Size: Configures the size of memory-mapped square chunks for RAM management.
+- Checkpointing: The tool automatically saves progress. Use `--resume` to bypass ray-tracing on a failed run.
 - Unified Output Generation: Exports georeferenced TIFFs, a KML file, an annotated graphical map, 
   a JSON run-summary, and the execution log into a single dynamically named output directory.
 ================================================================================
@@ -821,6 +837,14 @@ def validate_parameters(params):
     if params['tile_size'] <= 0:
         errors.append("tile_size must be strictly positive (> 0).")
 
+    # 8. Verify Resume Directory
+    if params.get('resume'):
+        res_dir = params.get('resume_dir')
+        if not res_dir or not os.path.exists(res_dir):
+            errors.append(f"Resume directory not found: {res_dir}")
+        elif not os.path.exists(os.path.join(res_dir, 'buffer_A.npy')):
+            errors.append(f"Cannot resume: 'buffer_A.npy' not found inside {res_dir}")
+
     # Execute Fail-Fast
     if errors:
         print("\n================================================================================")
@@ -845,10 +869,11 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             min_slope_deg=3.0, max_slope_deg=25.0,
                             region_name=None, fresnel_buffer=200.0, 
                             downsample_factor=4, run_output_dir=".", 
-                            output_image_format='png', tile_size=2048):
+                            output_image_format='png', tile_size=2048, 
+                            resume=False, resume_dir=None):
     """
     The main orchestrator. Now decoupled from logic, it sets up the environment,
-    calls the pipeline helpers in sequence, and cleans up memory constraints.
+    calls the pipeline helpers in sequence, and manages memory cleanup and checkpointing.
     """
     
     # Cast safety to ensure slice logic doesn't fail if passed as float via JSON
@@ -865,7 +890,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor,
         "min_altitude": min_altitude, "max_altitude": max_altitude,
         "min_slope_deg": min_slope_deg, "max_slope_deg": max_slope_deg,
-        "tile_size": tile_size
+        "tile_size": tile_size, "resume": resume, "resume_dir": resume_dir
     }
     
     print(f"\n=============================================")
@@ -900,47 +925,57 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         mem = psutil.virtual_memory()
         print(f"   -> System RAM: {mem.total/1024**3:.1f} GB (Free: {mem.available/1024**3:.1f} GB)")
     
-    # Create a temporary directory for memory-mapped operations on large DEM files
-    temp_dir = tempfile.mkdtemp()
-    print(f"   -> Temp Dir: {temp_dir}")
+    print(f"   -> Working Dir: {run_output_dir}")
+    if resume:
+        print(f"   -> Resuming From: {resume_dir}")
     print(f"=============================================\n")
 
     t_start_total = time.time()
+    
+    # Tracking variables for safe cleanup
+    path_A = None
+    path_B = None
+    success_flag = False
     
     try:
         # Step 1: Disk Setup
         print("[1/6] Loading Map Data...")
         t0 = time.time()
-        elevation, rows, cols, path_A, path_B, buf_a = load_dem_and_init_buffers(dem_path, temp_dir)
+        elevation, rows, cols, path_A, path_B, buf_a, is_resuming = load_dem_and_init_buffers(dem_path, run_output_dir, resume, resume_dir)
         est_disk_gb = (rows * cols * 2) / (1024**3) 
         print(f"      Map: {rows} x {cols} pixels")
         print(f"      Estimated Temp Disk Usage: ~{est_disk_gb:.2f} GB")
         print(f"      Time: {time.time()-t0:.2f}s")
         
-        # Step 2: Topographic Screen
-        print("\n[2/6] Identifying Candidates...")
-        t0 = time.time()
-        candidates_arr = get_candidates_chunked(
-            elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
-            min_alt=min_altitude, max_alt=max_altitude,
-            road_map_path=road_map_path, max_road_dist_km=max_road_dist_km,
-            min_aspect_deg=min_aspect_deg, max_aspect_deg=max_aspect_deg,
-            min_slope_deg=min_slope_deg, max_slope_deg=max_slope_deg,
-            tile_size=tile_size
-        )
-        total = candidates_arr.shape[0]
-        print(f"      Time: {time.time()-t0:.2f}s")
-        
-        if total == 0: 
-            print("No candidates found.")
-            return
+        if not is_resuming:
+            # Step 2: Topographic Screen
+            print("\n[2/6] Identifying Candidates...")
+            t0 = time.time()
+            candidates_arr = get_candidates_chunked(
+                elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
+                min_alt=min_altitude, max_alt=max_altitude,
+                road_map_path=road_map_path, max_road_dist_km=max_road_dist_km,
+                min_aspect_deg=min_aspect_deg, max_aspect_deg=max_aspect_deg,
+                min_slope_deg=min_slope_deg, max_slope_deg=max_slope_deg,
+                tile_size=tile_size
+            )
+            total = candidates_arr.shape[0]
+            print(f"      Time: {time.time()-t0:.2f}s")
+            
+            if total == 0: 
+                print("No candidates found.")
+                success_flag = True
+                return
+    
+            # Step 3: Physics Simulation
+            print(f"\n[3/6] Ray Tracing ({total} candidates)...")
+            t0 = time.time()
+            run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, num_cores, buf_a)
+            print(f"      Time: {time.time()-t0:.2f}s")
+        else:
+            print("\n[2/6 & 3/6] Resuming: Skipping candidate search and ray tracing...")
 
-        # Step 3: Physics Simulation
-        print(f"\n[3/6] Ray Tracing ({total} candidates)...")
-        t0 = time.time()
-        run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, num_cores, buf_a)
-        del buf_a  # Release memory map write lock to flush to disk
-        print(f"      Time: {time.time()-t0:.2f}s")
+        del buf_a  # Release memory map write lock to flush to disk securely
 
         # Step 4: Spatial Pruning
         print("\n[4/6] Cleaning Shapes...")
@@ -986,9 +1021,22 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         for fpath in generated_files:
             print(f"   -> {fpath}")
 
+        # Mark as cleanly finished so finally block knows to purge temporary arrays
+        success_flag = True
+
     finally:
-        try: shutil.rmtree(temp_dir)
-        except: pass
+        # Smart Cleanup
+        if success_flag:
+            try:
+                if path_A and os.path.exists(path_A): os.remove(path_A)
+                if path_B and os.path.exists(path_B): os.remove(path_B)
+            except: 
+                pass
+        else:
+            print(f"\n[!] Run did not complete successfully.")
+            print(f"    Buffer files have been retained in the workspace.")
+            print(f"    Resume this exact run later using: --resume --resume_dir {os.path.abspath(run_output_dir)}")
+            
         print(f"\nTotal Execution Time: {time.time() - t_start_total:.2f} seconds")
         print("Done.")
 
@@ -1050,6 +1098,8 @@ if __name__ == "__main__":
     parser.add_argument("--config_path", type=str, default=None, help="Path to external JSON configuration file.")
     parser.add_argument("--output_directory_base_with_given_json", type=str, default="../output/", help="Base directory for outputs when a JSON config is supplied (default: ../output/).")
     parser.add_argument("--output_image_format", type=str, default="png", help="Format of the saved map visual, e.g., png, pdf, svg (default: png).")
+    parser.add_argument("--resume", action="store_true", help="Include this flag to resume a previous run from the ray-tracing checkpoint.")
+    parser.add_argument("--resume_dir", type=str, default=None, help="Path to an output folder from a previously failed run to resume from the ray-tracing checkpoint.")
     
     # Tool Generation Arguments
     parser.add_argument("--generate_config", type=str, default=None, help="Supply a filepath to generate a default JSON config template and exit.")
@@ -1088,7 +1138,9 @@ if __name__ == "__main__":
             "generate_kml": True,
             "print_info": True,
             "output_directory_base_with_given_json": "../output/",
-            "output_image_format": "png"
+            "output_image_format": "png",
+            "resume": False,
+            "resume_dir": None
         }
         
         # Inject presets if specifically requested
@@ -1186,6 +1238,10 @@ if __name__ == "__main__":
         print("ERROR: Critical parameters 'origin_lat' and 'origin_lon' must be provided via config file, fallback, or CLI.")
         sys.exit(1)
 
+    # Default resume_dir to run_output_dir if resume is True and resume_dir not provided
+    if final_params.get('resume') and not final_params.get('resume_dir'):
+        final_params['resume_dir'] = run_output_dir
+
     # 6. Run Pre-Flight Validation (Fail-Fast Mechanism)
     validate_parameters(final_params)
 
@@ -1240,5 +1296,7 @@ if __name__ == "__main__":
         downsample_factor=final_params['downsample_factor'],
         run_output_dir=run_output_dir,
         output_image_format=final_params['output_image_format'],
-        tile_size=final_params['tile_size']
+        tile_size=final_params['tile_size'],
+        resume=final_params.get('resume', False),
+        resume_dir=final_params.get('resume_dir')
     )
