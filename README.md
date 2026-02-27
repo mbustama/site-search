@@ -30,6 +30,24 @@ pip install numpy scipy numba tifffile matplotlib joblib tqdm psutil
 
 ```
 
+### Automated Conda Environment Generation:
+
+Instead of installing packages manually, you can use the included `generate_env.py` script. This tool parses the main script using Python's Abstract Syntax Tree (AST) to securely identify all required third-party dependencies, checks what is missing from your active environment, and generates a clean, `conda-forge` prioritized `environment.yml` file.
+
+**Usage:**
+
+```bash
+# Generate the environment.yml file based on the main script's imports
+python generate_env.py
+
+# Create the new Conda environment from the generated file
+conda env create -f environment.yml
+
+# Activate the environment
+conda activate site_search
+
+```
+
 ---
 
 ## 2. Obtaining Input Data (DEMs)
