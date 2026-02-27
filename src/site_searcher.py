@@ -786,6 +786,7 @@ Customizable Constraints & Processing Parameters:
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
 - Downsample Factor: Modifies the internal resolution of the capacity masking, speeding up processing.
 - Tile Size: Configures the size of memory-mapped square chunks for RAM management.
+- Core Scaling: Control CPU thread allocation via `--num_cores` (defaults to all available cores).
 - Checkpointing: The tool automatically saves progress. Use `--resume` to bypass ray-tracing on a failed run.
 - Unified Output Generation: Exports georeferenced TIFFs, a KML file, an annotated graphical map, 
   a JSON run-summary, and the execution log into a single dynamically named output directory.
@@ -845,6 +846,14 @@ def validate_parameters(params):
         elif not os.path.exists(os.path.join(res_dir, 'buffer_A.npy')):
             errors.append(f"Cannot resume: 'buffer_A.npy' not found inside {res_dir}")
 
+    # 9. Verify CPU Cores
+    sys_cores = multiprocessing.cpu_count()
+    if params.get('num_cores', -1) != -1:
+        if params['num_cores'] <= 0:
+            errors.append(f"num_cores must be a positive integer or -1. Received: {params['num_cores']}")
+        elif params['num_cores'] > sys_cores:
+            errors.append(f"num_cores requested ({params['num_cores']}) exceeds available system cores ({sys_cores}).")
+
     # Execute Fail-Fast
     if errors:
         print("\n================================================================================")
@@ -870,7 +879,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             region_name=None, fresnel_buffer=200.0, 
                             downsample_factor=4, run_output_dir=".", 
                             output_image_format='png', tile_size=2048, 
-                            resume=False, resume_dir=None):
+                            resume=False, resume_dir=None, num_cores=-1):
     """
     The main orchestrator. Now decoupled from logic, it sets up the environment,
     calls the pipeline helpers in sequence, and manages memory cleanup and checkpointing.
@@ -890,7 +899,8 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor,
         "min_altitude": min_altitude, "max_altitude": max_altitude,
         "min_slope_deg": min_slope_deg, "max_slope_deg": max_slope_deg,
-        "tile_size": tile_size, "resume": resume, "resume_dir": resume_dir
+        "tile_size": tile_size, "resume": resume, "resume_dir": resume_dir,
+        "num_cores": num_cores
     }
     
     print(f"\n=============================================")
@@ -918,8 +928,9 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     print(f"\n=============================================")
     print(f"   SYSTEM & RESOURCE REPORT")
     print(f"=============================================")
-    num_cores = multiprocessing.cpu_count()
-    print(f"   -> CPU Cores: {num_cores}")
+    sys_cores = multiprocessing.cpu_count()
+    active_cores = sys_cores if num_cores == -1 else int(num_cores)
+    print(f"   -> CPU Cores: {active_cores} allocated (System Max: {sys_cores})")
     print(f"   -> Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED'}")
     if psutil:
         mem = psutil.virtual_memory()
@@ -970,7 +981,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             # Step 3: Physics Simulation
             print(f"\n[3/6] Ray Tracing ({total} candidates)...")
             t0 = time.time()
-            run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, num_cores, buf_a)
+            run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, active_cores, buf_a)
             print(f"      Time: {time.time()-t0:.2f}s")
         else:
             print("\n[2/6 & 3/6] Resuming: Skipping candidate search and ray tracing...")
@@ -1040,6 +1051,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         print(f"\nTotal Execution Time: {time.time() - t_start_total:.2f} seconds")
         print("Done.")
 
+
 # Custom Logger Interceptor
 class TeeLogger:
     """Duplicates stream writes to both the original terminal and an attached log file."""
@@ -1077,6 +1089,7 @@ if __name__ == "__main__":
     parser.add_argument("--fresnel_buffer", type=float, default=200.0, help="Clearance margin (in meters) for line-of-sight ray tracing (default: 200.0).")
     parser.add_argument("--downsample_factor", type=int, default=4, help="Internal capacity mask downsampling factor for processing speed (default: 4).")
     parser.add_argument("--tile_size", type=int, default=2048, help="Size of the square memory chunk for RAM management (default: 2048).")
+    parser.add_argument("--num_cores", type=int, default=-1, help="Number of CPU cores to use. Set to -1 to use all available cores (default: -1).")
     
     # Logistics and Geography Arguments
     parser.add_argument("--rfi_zones", type=str, default='none', help="Can be preset ('lima', 'arequipa') or a valid JSON string outlining custom exclusion zones.")
@@ -1127,6 +1140,7 @@ if __name__ == "__main__":
             "fresnel_buffer": 200.0,
             "downsample_factor": 4,
             "tile_size": 2048,
+            "num_cores": -1,
             "rfi_zones": "none",
             "road_map_path": None,
             "max_road_dist_km": 20.0,
@@ -1298,5 +1312,6 @@ if __name__ == "__main__":
         output_image_format=final_params['output_image_format'],
         tile_size=final_params['tile_size'],
         resume=final_params.get('resume', False),
-        resume_dir=final_params.get('resume_dir')
+        resume_dir=final_params.get('resume_dir'),
+        num_cores=final_params.get('num_cores', -1)
     )
