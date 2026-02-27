@@ -266,6 +266,7 @@ def load_dem_and_init_buffers(dem_path, temp_dir):
 def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
                            min_alt=None, max_alt=None, min_aspect_deg=None, max_aspect_deg=None, 
                            road_map_path=None, max_road_dist_km=None, 
+                           min_slope_deg=3.0, max_slope_deg=25.0,
                            tile_size=2048):
     """
     Step 2 Pipeline: Memory-efficient topographic screening. Iterates over the large DEM in chunks (tiles) 
@@ -281,6 +282,7 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
     - min_aspect_deg, max_aspect_deg (float): Required facing directions for slopes.
     - road_map_path (str): Path to an aligned TIFF containing distance-to-road values.
     - max_road_dist_km (float): Maximum allowed distance from a road.
+    - min_slope_deg, max_slope_deg (float): Required steepness limits for detector slopes.
     - tile_size (int): Size of the square chunk to process in RAM at one time.
     
     Returns:
@@ -344,8 +346,8 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
                 slope = np.degrees(np.arctan(np.sqrt(dx**2 + dy**2)))
                 aspect = np.degrees(np.arctan2(-dx, dy)) % 360
                 
-                # Filter 1: Fundamental detector slope requirement (3-25 degrees)
-                mask = (slope >= 3) & (slope <= 25)
+                # Filter 1: Fundamental detector slope requirement
+                mask = (slope >= min_slope_deg) & (slope <= max_slope_deg)
                 
                 # Filter 2: Altitude bounds
                 if min_alt is not None: mask &= (chunk >= min_alt)
@@ -751,7 +753,7 @@ This tool performs a high-performance topographic and physics simulation to
 identify suitable deployment sites for the GRAND array.
 
 Core Workflow:
-1. Topographic Filtering: Scans the DEM for terrain with suitable slopes (3-25 degrees),
+1. Topographic Filtering: Scans the DEM for terrain with suitable slopes (configurable, default 3-25 degrees),
    enforcing altitude limits and specified facing directions (Aspect).
 2. Logistics & RFI: Masks out areas overlapping populated centers and, optionally,
    areas situated too far from road infrastructure.
@@ -764,6 +766,7 @@ Core Workflow:
    the true physical capacity of the resulting sites.
    
 Customizable Constraints & Processing Parameters:
+- Slope Bounds: Customizable minimum and maximum terrain steepness in degrees.
 - RFI Zones: Accept pre-defined sets ('lima', 'arequipa') or custom geometry lists via JSON config.
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
 - Downsample Factor: Modifies the internal resolution of the capacity masking, speeding up processing.
@@ -806,6 +809,12 @@ def validate_parameters(params):
     if params['min_altitude'] is not None and params['max_altitude'] is not None:
         if params['min_altitude'] >= params['max_altitude']:
             errors.append("min_altitude must be strictly less than max_altitude.")
+            
+    # 6. Verify Slope bounds logic
+    if params['min_slope_deg'] < 0:
+        errors.append("min_slope_deg cannot be negative.")
+    if params['min_slope_deg'] >= params['max_slope_deg']:
+        errors.append("min_slope_deg must be strictly less than max_slope_deg.")
 
     # Execute Fail-Fast
     if errors:
@@ -828,6 +837,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             grid_type='square', generate_kml=False,
                             search_mode='single', min_sub_array_size=100,
                             min_aspect_deg=None, max_aspect_deg=None,
+                            min_slope_deg=3.0, max_slope_deg=25.0,
                             region_name=None, fresnel_buffer=200.0, 
                             downsample_factor=4, run_output_dir=".", 
                             output_image_format='png'):
@@ -847,7 +857,8 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         "min_sub_array": min_sub_array_size,
         "grid_type": grid_type, "road_map": road_map_path,
         "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor,
-        "min_altitude": min_altitude, "max_altitude": max_altitude
+        "min_altitude": min_altitude, "max_altitude": max_altitude,
+        "min_slope_deg": min_slope_deg, "max_slope_deg": max_slope_deg
     }
     
     print(f"\n=============================================")
@@ -858,6 +869,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     print(f"   -> Target: {target_antennas} antennas")
     print(f"   -> Spacing: {antenna_spacing_km} km ({grid_type} grid)")
     print(f"   -> Min Width: {min_width_km} km")
+    print(f"   -> Slope Range: {min_slope_deg}° to {max_slope_deg}°")
     print(f"   -> Target Dist: {min_dist_km} - {max_dist_km} km")
     print(f"   -> Physics: Fresnel Buffer {fresnel_buffer}m | Downsample Factor {downsample_factor}")
     if road_map_path:
@@ -904,7 +916,8 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
             min_alt=min_altitude, max_alt=max_altitude,
             road_map_path=road_map_path, max_road_dist_km=max_road_dist_km,
-            min_aspect_deg=min_aspect_deg, max_aspect_deg=max_aspect_deg
+            min_aspect_deg=min_aspect_deg, max_aspect_deg=max_aspect_deg,
+            min_slope_deg=min_slope_deg, max_slope_deg=max_slope_deg
         )
         total = candidates_arr.shape[0]
         print(f"      Time: {time.time()-t0:.2f}s")
@@ -1002,6 +1015,8 @@ if __name__ == "__main__":
     parser.add_argument("--grid_type", type=str, choices=['square', 'hex'], default='hex', help="Antenna layout grid type (default: 'hex').")
     
     # Internal Math & Physics Parameters
+    parser.add_argument("--min_slope_deg", type=float, default=3.0, help="Minimum terrain steepness in degrees (default: 3.0).")
+    parser.add_argument("--max_slope_deg", type=float, default=25.0, help="Maximum terrain steepness in degrees (default: 25.0).")
     parser.add_argument("--fresnel_buffer", type=float, default=200.0, help="Clearance margin (in meters) for line-of-sight ray tracing (default: 200.0).")
     parser.add_argument("--downsample_factor", type=int, default=4, help="Internal capacity mask downsampling factor for processing speed (default: 4).")
     
@@ -1043,6 +1058,8 @@ if __name__ == "__main__":
             "min_width_km": 2.0,
             "min_altitude": None,
             "max_altitude": None,
+            "min_slope_deg": 3.0,
+            "max_slope_deg": 25.0,
             "antenna_spacing_km": 1.0,
             "min_dist_km": 10.0,
             "max_dist_km": 80.0,
@@ -1205,6 +1222,8 @@ if __name__ == "__main__":
         min_sub_array_size=final_params['min_sub_array_size'],
         min_aspect_deg=final_params['min_aspect_deg'], 
         max_aspect_deg=final_params['max_aspect_deg'],
+        min_slope_deg=final_params['min_slope_deg'],
+        max_slope_deg=final_params['max_slope_deg'],
         region_name=final_params['region_name'],
         fresnel_buffer=final_params['fresnel_buffer'],
         downsample_factor=final_params['downsample_factor'],
