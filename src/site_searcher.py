@@ -618,17 +618,19 @@ def generate_kml_file(mask, elevation, filename, origin_lat, origin_lon, cell_si
         print(f"   -> WARNING: KML generation failed (Skipping KML). Error: {e}")
 
 def generate_visualizations_and_outputs(dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
-                                        origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, output_image_path, 
+                                        origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, run_output_dir, 
                                         output_image_format, rfi_zones, search_mode, grid_type, antenna_spacing_km, 
                                         min_altitude, max_altitude, region_name, final_params):
     """
     Step 6 Pipeline: Formats and exports all scientific products including geo-registered TIFs, KML models, 
-    an annotated map graphic, and a serialized JSON summary of the run parameters and results.
+    an annotated map graphic, and a serialized JSON summary of the run parameters and results 
+    to the designated unified output directory.
     """
     generated_files = []
+    base_filename = "grand_search_results_" + os.path.splitext(os.path.basename(dem_path))[0]
     
     # Save TIF
-    out_tif = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".tif"
+    out_tif = os.path.join(run_output_dir, base_filename + ".tif")
     tiff.imwrite(out_tif, small_final)
     generated_files.append(os.path.abspath(out_tif))
     
@@ -639,7 +641,7 @@ def generate_visualizations_and_outputs(dem_path, elevation, small_final, labele
     
     # Save KML
     if generate_kml:
-        kml_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".kml"
+        kml_name = os.path.join(run_output_dir, base_filename + ".kml")
         generate_kml_file(small_final, elevation, kml_name, origin_lat, origin_lon, new_res_deg)
         generated_files.append(os.path.abspath(kml_name))
 
@@ -711,14 +713,8 @@ def generate_visualizations_and_outputs(dem_path, elevation, small_final, labele
         fs = 'small' if len(legend_labels) > 8 else 'medium'
         ax.legend(legend_handles, legend_labels, loc='upper right', fontsize=fs, framealpha=0.8)
         
-        if output_image_path is not None:
-            img_name = output_image_path
-        else:
-            img_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+"."+output_image_format.strip('.')
+        img_name = os.path.join(run_output_dir, base_filename + "." + output_image_format.strip('.'))
         
-        if os.path.dirname(img_name):
-            os.makedirs(os.path.dirname(img_name), exist_ok=True)
-            
         plt.savefig(img_name, format=output_image_format.strip('.'), dpi=150, bbox_inches='tight')
         generated_files.append(os.path.abspath(img_name))
         print(f"   -> Map saved.")
@@ -737,7 +733,7 @@ def generate_visualizations_and_outputs(dem_path, elevation, small_final, labele
             "sites": site_details
         }
     }
-    json_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".json"
+    json_name = os.path.join(run_output_dir, base_filename + ".json")
     with open(json_name, "w") as f:
         json.dump(out_data, f, indent=4)
     generated_files.append(os.path.abspath(json_name))
@@ -771,11 +767,8 @@ Customizable Constraints & Processing Parameters:
 - RFI Zones: Accept pre-defined sets ('lima', 'arequipa') or custom geometry lists via JSON config.
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
 - Downsample Factor: Modifies the internal resolution of the capacity masking, speeding up processing.
-- Output Paths: Export custom image paths and formats (png, pdf, svg) directly via CLI or config.
-   
-Output:
-The script outputs georeferenced TIFFs, a KML file for Google Earth, an annotated 
-PNG (or preferred format) map, and a JSON summary of all viable sites found.
+- Unified Output Generation: Exports georeferenced TIFFs, a KML file, an annotated graphical map, 
+  a JSON run-summary, and the execution log into a single dynamically named output directory.
 ================================================================================
     """)
 
@@ -836,7 +829,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             search_mode='single', min_sub_array_size=100,
                             min_aspect_deg=None, max_aspect_deg=None,
                             region_name=None, fresnel_buffer=200.0, 
-                            downsample_factor=4, output_image_path=None, 
+                            downsample_factor=4, run_output_dir=".", 
                             output_image_format='png'):
     """
     The main orchestrator. Now decoupled from logic, it sets up the environment,
@@ -951,7 +944,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         t0 = time.time()
         generated_files = generate_visualizations_and_outputs(
             dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
-            origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, output_image_path, 
+            origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, run_output_dir, 
             output_image_format, rfi_zones, search_mode, grid_type, antenna_spacing_km, 
             min_altitude, max_altitude, region_name, export_params
         )
@@ -1030,8 +1023,7 @@ if __name__ == "__main__":
     
     # IO / Configs mapping & Tools
     parser.add_argument("--config_path", type=str, default=None, help="Path to external JSON configuration file.")
-    parser.add_argument("--log_path", type=str, default="../output/logs/log.txt", help="Path to store execution log (default: ../output/logs/log.txt).")
-    parser.add_argument("--output_image_path", type=str, default=None, help="Specific file path to save the generated map visual (optional).")
+    parser.add_argument("--output_directory_base_with_given_json", type=str, default="../output/", help="Base directory for outputs when a JSON config is supplied (default: ../output/).")
     parser.add_argument("--output_image_format", type=str, default="png", help="Format of the saved map visual, e.g., png, pdf, svg (default: png).")
     
     # Tool Generation Arguments
@@ -1067,8 +1059,7 @@ if __name__ == "__main__":
             "region_name": "Custom Region",
             "generate_kml": True,
             "print_info": True,
-            "log_path": "../output/logs/log.txt",
-            "output_image_path": None,
+            "output_directory_base_with_given_json": "../output/",
             "output_image_format": "png"
         }
         
@@ -1110,15 +1101,24 @@ if __name__ == "__main__":
         with open(fallback_path, 'r') as f:
             fallback_params = json.load(f)
 
-    # Determine logging location hierarchically 
-    log_path = args.log_path
-    if "log_path" in config_params:
-        log_path = config_params["log_path"]
-    elif "log_path" in fallback_params:
-        log_path = fallback_params["log_path"]
+    # 3. Determine Unified Logging and Output Directory Hierarchically
+    base_dir = args.output_directory_base_with_given_json
+    if "output_directory_base_with_given_json" in config_params:
+        base_dir = config_params["output_directory_base_with_given_json"]
+    elif "output_directory_base_with_given_json" in fallback_params:
+        base_dir = fallback_params["output_directory_base_with_given_json"]
 
-    # 3. Apply Custom Standard-Out / Standard-Error interceptors for the log file
-    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+    if args.config_path and os.path.exists(args.config_path):
+        config_basename = os.path.splitext(os.path.basename(args.config_path))[0]
+        run_output_dir = os.path.join(base_dir, config_basename)
+    else:
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_output_dir = os.path.join("..", "output", timestamp_str)
+
+    os.makedirs(run_output_dir, exist_ok=True)
+    
+    # 4. Apply Custom Standard-Out / Standard-Error interceptors for the log file
+    log_path = os.path.join(run_output_dir, "log.txt")
     log_file = open(log_path, "a", encoding="utf-8")
     
     sys.stdout = TeeLogger(sys.stdout, log_file)
@@ -1132,14 +1132,14 @@ if __name__ == "__main__":
     else:
         print(f"No config file provided. Relying on CLI arguments and fallbacks.")
     print(f"Using fallbacks file: {os.path.abspath(fallback_path)}")
-    print(f"Log file initialized at: {os.path.abspath(log_path)}")
+    print(f"Unified output directory initialized at: {os.path.abspath(run_output_dir)}")
     print(f"================================================================================\n")
 
-    # 4. Reconcile Configuration Strategy (Config > Fallback > CLI / Standard defaults)
+    # 5. Reconcile Configuration Strategy (Config > Fallback > CLI / Standard defaults)
     final_params = {}
     
     # Collect all available arguments parsed from CLI framework
-    param_names = [action.dest for action in parser._actions if action.dest not in ('help', 'config_path', 'log_path', 'generate_config', 'config_preset')]
+    param_names = [action.dest for action in parser._actions if action.dest not in ('help', 'config_path', 'generate_config', 'config_preset')]
     
     for param in param_names:
         if param in config_params:
@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
         print("ERROR: Critical parameters 'origin_lat' and 'origin_lon' must be provided via config file, fallback, or CLI.")
         sys.exit(1)
 
-    # 5. Run Pre-Flight Validation (Fail-Fast Mechanism)
+    # 6. Run Pre-Flight Validation (Fail-Fast Mechanism)
     validate_parameters(final_params)
 
     # Handle RFI Zone selection mapping (Checks Config-passed custom lists, or matches string presets)
@@ -1208,6 +1208,6 @@ if __name__ == "__main__":
         region_name=final_params['region_name'],
         fresnel_buffer=final_params['fresnel_buffer'],
         downsample_factor=final_params['downsample_factor'],
-        output_image_path=final_params['output_image_path'],
+        run_output_dir=run_output_dir,
         output_image_format=final_params['output_image_format']
     )
