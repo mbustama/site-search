@@ -19,12 +19,54 @@ import time
 import json
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import re
 
 # Try to import psutil for RAM stats
 try:
     import psutil
 except ImportError:
     psutil = None
+
+# ==========================================
+#          UI THEME & FORMATTING
+# ==========================================
+# Enables ANSI escape sequences in Windows 10+ terminals
+if sys.platform == 'win32':
+    os.system('') 
+
+def supports_color():
+    """Checks if the terminal supports ANSI colors."""
+    supported_platform = sys.platform != 'win32' or 'ANSICON' in os.environ or 'WT_SESSION' in os.environ or os.environ.get('TERM') == 'xterm-256color'
+    is_a_tty = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+    return supported_platform and is_a_tty
+
+def supports_emoji():
+    """Checks if the terminal supports UTF-8 for emojis."""
+    if sys.stdout.encoding:
+        return sys.stdout.encoding.lower() == 'utf-8'
+    return False
+
+USE_COLOR = supports_color()
+USE_EMOJI = supports_emoji()
+
+class C:
+    HEADER = '\033[96m' if USE_COLOR else ''  # Cyan
+    OK = '\033[92m' if USE_COLOR else ''      # Green
+    WARN = '\033[93m' if USE_COLOR else ''    # Yellow
+    FAIL = '\033[91m' if USE_COLOR else ''    # Red
+    BOLD = '\033[1m' if USE_COLOR else ''     # Bold
+    MAGENTA = '\033[95m' if USE_COLOR else '' # Magenta
+    RESET = '\033[0m' if USE_COLOR else ''    # Reset
+
+class Icon:
+    MAP = '🗺️  ' if USE_EMOJI else '[*] '
+    GEAR = '⚙️  ' if USE_EMOJI else '[~] '
+    BROOM = '🧹 ' if USE_EMOJI else '[C] '
+    DISK = '💾 ' if USE_EMOJI else '[S] '
+    WARN = '⚠️  ' if USE_EMOJI else '[!] '
+    CHECK = '✅ ' if USE_EMOJI else '[✓] '
+    INFO = 'ℹ️  ' if USE_EMOJI else '[i] '
+    CROSS = '❌ ' if USE_EMOJI else '[x] '
 
 # ==========================================
 #               CONFIGURATION
@@ -264,10 +306,10 @@ def load_dem_and_init_buffers(dem_path, temp_dir, resume=False, resume_dir=None)
     if resume and resume_dir and os.path.exists(os.path.join(resume_dir, "buffer_A.npy")):
         src_buffer = os.path.join(resume_dir, "buffer_A.npy")
         if os.path.abspath(src_buffer) != os.path.abspath(path_A):
-            print(f"      -> Resuming: Copying existing physics buffer from {src_buffer}...")
+            print(f"      {Icon.INFO}{C.WARN}Resuming: Copying existing physics buffer from {src_buffer}...{C.RESET}")
             shutil.copy(src_buffer, path_A)
         else:
-            print(f"      -> Resuming: Using existing physics buffer at {src_buffer}...")
+            print(f"      {Icon.INFO}{C.WARN}Resuming: Using existing physics buffer at {src_buffer}...{C.RESET}")
         buf_a = np.lib.format.open_memmap(path_A, mode='r+', shape=(rows, cols), dtype=bool)
         is_resuming = True
     else:
@@ -319,11 +361,11 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
         if os.path.exists(road_map_path):
             try:
                 road_dist_map = tiff.imread(road_map_path, out='memmap')
-                print(f"   -> Logistics: Loaded Road Distance Map ({road_map_path})")
+                print(f"      {Icon.INFO}Logistics: Loaded Road Distance Map ({road_map_path})")
             except:
-                print(f"   -> WARNING: Could not load road map.")
+                print(f"      {C.WARN}{Icon.WARN}WARNING: Could not load road map.{C.RESET}")
         else:
-            print(f"   -> WARNING: Road map file not found.")
+            print(f"      {C.WARN}{Icon.WARN}WARNING: Road map file not found.{C.RESET}")
 
     # Convert geographic RFI definitions into pixel coordinates for local checking
     rfi_circles = [] 
@@ -350,7 +392,7 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
     c_steps = range(0, cols, tile_size)
     
     # Process the map in chunks to avoid blowing out system RAM
-    with tqdm(total=len(r_steps)*len(c_steps), desc="   Scanning Topography", unit="tile") as pbar:
+    with tqdm(total=len(r_steps)*len(c_steps), desc="   Scanning Topography", unit="tile", colour='magenta' if USE_COLOR else None) as pbar:
         for r in r_steps:
             for c in c_steps:
                 r_end = min(r + tile_size, rows)
@@ -425,7 +467,7 @@ def run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, f
     batches = np.array_split(candidates_arr, num_cores * 4)
     results = Parallel(n_jobs=-1)(
         delayed(check_physics_chunk)(batch, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km) 
-        for batch in tqdm(batches, desc="   Simulating", unit="batch")
+        for batch in tqdm(batches, desc="   Simulating", unit="batch", colour='magenta' if USE_COLOR else None)
     )
     # Reconstruct the boolean mask from returned ray-cast coordinates
     for r_list, c_list in results:
@@ -441,7 +483,7 @@ def apply_morphology_pingpong(source_path, dest_path, shape, dtype, operation_fu
     dest = np.lib.format.open_memmap(dest_path, mode='r+', shape=shape, dtype=dtype)
     rows, cols = shape
     
-    with tqdm(total=(rows//tile_size + 1)*(cols//tile_size + 1), desc=f"   {desc}", unit="tile") as pbar:
+    with tqdm(total=(rows//tile_size + 1)*(cols//tile_size + 1), desc=f"   {desc}", unit="tile", colour='magenta' if USE_COLOR else None) as pbar:
         # Pad the chunk by half the structure size to prevent edge artifacts between chunks
         pad = max(structure.shape) // 2
         for r in range(0, rows, tile_size):
@@ -589,7 +631,7 @@ def generate_kml_file(mask, elevation, filename, origin_lat, origin_lon, cell_si
     - filename (str): Output path for the KML file.
     - origin_lat, origin_lon, cell_size_deg: Used to convert array pixel indices to GPS coordinates.
     """
-    print(f"   -> Generating KML: {filename} ...")
+    print(f"      {Icon.INFO}Generating KML: {os.path.basename(filename)} ...")
     
     try:
         root = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
@@ -633,9 +675,8 @@ def generate_kml_file(mask, elevation, filename, origin_lat, origin_lon, cell_si
             site_idx += 1
                 
         ET.ElementTree(root).write(filename, encoding='UTF-8', xml_declaration=True)
-        print(f"   -> KML saved to '{filename}'")
     except Exception as e:
-        print(f"   -> WARNING: KML generation failed (Skipping KML). Error: {e}")
+        print(f"      {C.WARN}{Icon.WARN}WARNING: KML generation failed (Skipping KML). Error: {e}{C.RESET}")
 
 def generate_visualizations_and_outputs(dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
                                         origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, run_output_dir, 
@@ -737,10 +778,10 @@ def generate_visualizations_and_outputs(dem_path, elevation, small_final, labele
         
         plt.savefig(img_name, format=output_image_format.strip('.'), dpi=150, bbox_inches='tight')
         generated_files.append(os.path.abspath(img_name))
-        print(f"   -> Map saved.")
+        print(f"      {Icon.CHECK}Map saved.")
         
     except Exception as e:
-        print(f"Viz Error: {e}")
+        print(f"      {C.FAIL}{Icon.CROSS}Viz Error: {e}{C.RESET}")
 
     # Save JSON output log
     out_data = {
@@ -757,20 +798,20 @@ def generate_visualizations_and_outputs(dem_path, elevation, small_final, labele
     with open(json_name, "w") as f:
         json.dump(out_data, f, indent=4)
     generated_files.append(os.path.abspath(json_name))
-    print(f"   -> JSON saved.")
+    print(f"      {Icon.CHECK}JSON Data Summary saved.")
     
     return generated_files
 
 def print_tool_explanation():
     """Outputs a formatted explanation of the tool's capabilities and logic to the console."""
-    print("""
-================================================================================
-GRAND NEUTRINO OBSERVATORY - AUTOMATED SITE SEARCH TOOL
-================================================================================
+    print(f"""
+{C.HEADER}================================================================================
+{C.BOLD}GRAND NEUTRINO OBSERVATORY - AUTOMATED SITE SEARCH TOOL{C.RESET}{C.HEADER}
+================================================================================{C.RESET}
 This tool performs a high-performance topographic and physics simulation to 
 identify suitable deployment sites for the GRAND array.
 
-Core Workflow:
+{C.BOLD}Core Workflow:{C.RESET}
 1. Topographic Filtering: Scans the DEM for terrain with suitable slopes (configurable, default 3-25 degrees),
    enforcing altitude limits and specified facing directions (Aspect).
 2. Logistics & RFI: Masks out areas overlapping populated centers and, optionally,
@@ -783,7 +824,7 @@ Core Workflow:
 5. Grid Packing: Simulates placing antennas in 'hex' or 'square' grids to calculate 
    the true physical capacity of the resulting sites.
    
-Customizable Constraints & Processing Parameters:
+{C.BOLD}Customizable Constraints & Processing Parameters:{C.RESET}
 - Slope Bounds: Customizable minimum and maximum terrain steepness in degrees.
 - RFI Zones: Accept pre-defined sets ('lima', 'arequipa') or custom geometry lists via JSON config.
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
@@ -793,7 +834,7 @@ Customizable Constraints & Processing Parameters:
 - Checkpointing: The tool automatically saves progress. Use `--resume` to bypass ray-tracing on a failed run.
 - Unified Output Generation: Exports georeferenced TIFFs, a KML file, an annotated graphical map, 
   a JSON run-summary, and the execution log into a single dynamically named output directory.
-================================================================================
+{C.HEADER}================================================================================{C.RESET}
     """)
 
 def validate_parameters(params):
@@ -859,12 +900,12 @@ def validate_parameters(params):
 
     # Execute Fail-Fast
     if errors:
-        print("\n================================================================================")
-        print("PRE-FLIGHT VALIDATION FAILED:")
+        print(f"\n{C.FAIL}================================================================================{C.RESET}")
+        print(f"{C.FAIL}{C.BOLD}PRE-FLIGHT VALIDATION FAILED:{C.RESET}")
         for error in errors:
-            print(f"  - {error}")
-        print("Please correct the parameters in your config file or CLI and try again.")
-        print("================================================================================\n")
+            print(f"  {C.FAIL}{Icon.CROSS}{error}{C.RESET}")
+        print(f"{C.WARN}Please correct the parameters in your config file or CLI and try again.{C.RESET}")
+        print(f"{C.FAIL}================================================================================{C.RESET}\n")
         sys.exit(1)
 
 # ==========================================
@@ -906,43 +947,43 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         "num_cores": num_cores
     }
     
-    print(f"\n=============================================")
-    print(f"   GRAND SITE SEARCH: RUN PARAMETERS")
-    print(f"=============================================")
-    print(f"   -> DEM File: {dem_path}")
-    print(f"   -> Origin: {origin_lat}, {origin_lon}")
-    print(f"   -> Target: {target_antennas} antennas")
-    print(f"   -> Spacing: {antenna_spacing_km} km ({grid_type} grid)")
-    print(f"   -> Min Width: {min_width_km} km")
-    print(f"   -> Slope Range: {min_slope_deg}° to {max_slope_deg}°")
-    print(f"   -> Target Dist: {min_dist_km} - {max_dist_km} km")
-    print(f"   -> Physics: Fresnel Buffer {fresnel_buffer}m | Downsample Factor {downsample_factor}")
-    print(f"   -> Memory: Tile Size {tile_size}x{tile_size} px")
+    print(f"\n{C.HEADER}============================================={C.RESET}")
+    print(f"   {C.BOLD}GRAND SITE SEARCH: RUN PARAMETERS{C.RESET}")
+    print(f"{C.HEADER}============================================={C.RESET}")
+    print(f"   -> DEM File: {C.MAGENTA}{dem_path}{C.RESET}")
+    print(f"   -> Origin: {C.MAGENTA}{origin_lat}, {origin_lon}{C.RESET}")
+    print(f"   -> Target: {C.MAGENTA}{target_antennas} antennas{C.RESET}")
+    print(f"   -> Spacing: {C.MAGENTA}{antenna_spacing_km} km{C.RESET} ({grid_type} grid)")
+    print(f"   -> Min Width: {C.MAGENTA}{min_width_km} km{C.RESET}")
+    print(f"   -> Slope Range: {C.MAGENTA}{min_slope_deg}° to {max_slope_deg}°{C.RESET}")
+    print(f"   -> Target Dist: {C.MAGENTA}{min_dist_km} - {max_dist_km} km{C.RESET}")
+    print(f"   -> Physics: Fresnel Buffer {C.MAGENTA}{fresnel_buffer}m{C.RESET} | Downsample Factor {C.MAGENTA}{downsample_factor}{C.RESET}")
+    print(f"   -> Memory: Tile Size {C.MAGENTA}{tile_size}x{tile_size} px{C.RESET}")
     if road_map_path:
-        print(f"   -> Logistics: Require road within {max_road_dist_km} km")
+        print(f"   -> Logistics: Require road within {C.MAGENTA}{max_road_dist_km} km{C.RESET}")
     if min_altitude or max_altitude:
         min_s = f"{min_altitude}m" if min_altitude else "0m"
         max_s = f"{max_altitude}m" if max_altitude else "Inf"
-        print(f"   -> Altitude: {min_s} < h < {max_s}")
+        print(f"   -> Altitude: {C.MAGENTA}{min_s} < h < {max_s}{C.RESET}")
     if min_aspect_deg is not None and max_aspect_deg is not None:
-        print(f"   -> Aspect Range: {min_aspect_deg}° to {max_aspect_deg}°") 
-    print(f"   -> RFI Zones: {len(rfi_zones) if rfi_zones else 0} active (Numba Optimized)")
+        print(f"   -> Aspect Range: {C.MAGENTA}{min_aspect_deg}° to {max_aspect_deg}°{C.RESET}") 
+    print(f"   -> RFI Zones: {C.MAGENTA}{len(rfi_zones) if rfi_zones else 0} active{C.RESET} (Numba Optimized)")
 
-    print(f"\n=============================================")
-    print(f"   SYSTEM & RESOURCE REPORT")
-    print(f"=============================================")
+    print(f"\n{C.HEADER}============================================={C.RESET}")
+    print(f"   {C.BOLD}SYSTEM & RESOURCE REPORT{C.RESET}")
+    print(f"{C.HEADER}============================================={C.RESET}")
     sys_cores = multiprocessing.cpu_count()
     active_cores = sys_cores if num_cores == -1 else int(num_cores)
-    print(f"   -> CPU Cores: {active_cores} allocated (System Max: {sys_cores})")
-    print(f"   -> Numba JIT: {'ENABLED' if HAS_NUMBA else 'DISABLED'}")
+    print(f"   -> CPU Cores: {C.MAGENTA}{active_cores} allocated{C.RESET} (System Max: {sys_cores})")
+    print(f"   -> Numba JIT: {C.OK}ENABLED{C.RESET}" if HAS_NUMBA else f"   -> Numba JIT: {C.FAIL}DISABLED{C.RESET}")
     if psutil:
         mem = psutil.virtual_memory()
-        print(f"   -> System RAM: {mem.total/1024**3:.1f} GB (Free: {mem.available/1024**3:.1f} GB)")
+        print(f"   -> System RAM: {C.MAGENTA}{mem.total/1024**3:.1f} GB{C.RESET} (Free: {mem.available/1024**3:.1f} GB)")
     
-    print(f"   -> Working Dir: {run_output_dir}")
+    print(f"   -> Working Dir: {C.MAGENTA}{run_output_dir}{C.RESET}")
     if resume:
-        print(f"   -> Resuming From: {resume_dir}")
-    print(f"=============================================\n")
+        print(f"   -> Resuming From: {C.WARN}{resume_dir}{C.RESET}")
+    print(f"{C.HEADER}============================================={C.RESET}\n")
 
     t_start_total = time.time()
     
@@ -953,17 +994,17 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     
     try:
         # Step 1: Disk Setup
-        print("[1/6] Loading Map Data...")
+        print(f"{C.BOLD}[1/6]{C.RESET} {Icon.MAP}Loading Map Data...")
         t0 = time.time()
         elevation, rows, cols, path_A, path_B, buf_a, is_resuming = load_dem_and_init_buffers(dem_path, run_output_dir, resume, resume_dir)
         est_disk_gb = (rows * cols * 2) / (1024**3) 
-        print(f"      Map: {rows} x {cols} pixels")
-        print(f"      Estimated Temp Disk Usage: ~{est_disk_gb:.2f} GB")
+        print(f"      Map: {C.MAGENTA}{rows} x {cols}{C.RESET} pixels")
+        print(f"      Estimated Temp Disk Usage: {C.MAGENTA}~{est_disk_gb:.2f} GB{C.RESET}")
         print(f"      Time: {time.time()-t0:.2f}s")
         
         if not is_resuming:
             # Step 2: Topographic Screen
-            print("\n[2/6] Identifying Candidates...")
+            print(f"\n{C.BOLD}[2/6]{C.RESET} {Icon.GEAR}Identifying Candidates...")
             t0 = time.time()
             candidates_arr = get_candidates_chunked(
                 elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
@@ -977,41 +1018,41 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             print(f"      Time: {time.time()-t0:.2f}s")
             
             if total == 0: 
-                print("No candidates found.")
+                print(f"      {Icon.CROSS}{C.WARN}No viable candidates found in topographic pass.{C.RESET}")
                 success_flag = True
                 return
     
             # Step 3: Physics Simulation
-            print(f"\n[3/6] Ray Tracing ({total} candidates)...")
+            print(f"\n{C.BOLD}[3/6]{C.RESET} {Icon.GEAR}Ray Tracing ({C.MAGENTA}{total}{C.RESET} candidates)...")
             t0 = time.time()
             run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, active_cores, buf_a)
             print(f"      Time: {time.time()-t0:.2f}s")
         else:
-            print("\n[2/6 & 3/6] Resuming: Skipping candidate search and ray tracing...")
+            print(f"\n{C.BOLD}[2/6 & 3/6]{C.RESET} {Icon.GEAR}Resuming: Skipping candidate search and ray tracing...")
 
         del buf_a  # Release memory map write lock to flush to disk securely
 
         # Step 4: Spatial Pruning
-        print("\n[4/6] Cleaning Shapes...")
+        print(f"\n{C.BOLD}[4/6]{C.RESET} {Icon.BROOM}Cleaning Shapes...")
         t0 = time.time()
         clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km, tile_size)
         print(f"      Time: {time.time()-t0:.2f}s")
 
         # Step 5: Capacity Analysis
-        print("\n[5/6] Final Analysis...")
+        print(f"\n{C.BOLD}[5/6]{C.RESET} {Icon.INFO}Final Analysis...")
         t0 = time.time()
         small_final, labeled_viz, site_details, cumulative_capacity, count = analyze_sites_and_capacity(
             path_A, elevation, rows, cols, cell_size, downsample_factor, search_mode, target_antennas, min_sub_array_size, antenna_spacing_km, grid_type
         )
         if search_mode == 'distributed':
-            print(f"   -> Distributed: {count} sites found.")
-            print(f"   -> Total Cap: {cumulative_capacity} (Target: {target_antennas})")
+            print(f"      Distributed: {C.MAGENTA}{count}{C.RESET} sites found.")
+            print(f"      Total Cap: {C.MAGENTA}{cumulative_capacity}{C.RESET} (Target: {target_antennas})")
         else:
-            print(f"   -> Single: {count} valid sites found.")
+            print(f"      Single: {C.MAGENTA}{count}{C.RESET} valid sites found.")
         print(f"      Time: {time.time()-t0:.2f}s")
 
         # Step 6: Create Outputs
-        print(f"\n[6/6] Saving & Visualization...")
+        print(f"\n{C.BOLD}[6/6]{C.RESET} {Icon.DISK}Saving & Visualization...")
         t0 = time.time()
         generated_files = generate_visualizations_and_outputs(
             dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
@@ -1021,19 +1062,25 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         )
         print(f"      Time Elapsed: {time.time()-t0:.2f}s")
         
-        print(f"\n=============================================")
-        print(f"   RESULTS SUMMARY")
-        print(f"=============================================")
-        print(f"   -> Sites Found: {count}")
-        for site in site_details:
-            print(f"      Site {site['site_id']}: {site['area_km2']} km² | Cap: {site['capacity_exact']} ({site['grid_type']}) | Faces: {site['facing_direction']}")
+        # Results Table Printout
+        print(f"\n{C.HEADER}============================================={C.RESET}")
+        print(f"   {Icon.CHECK}{C.BOLD}RESULTS SUMMARY: {count} Sites Found{C.RESET}")
+        print(f"{C.HEADER}============================================={C.RESET}")
         
+        if count > 0:
+            print(f"   {C.BOLD}{'ID':>4} | {'Area (km²)':>12} | {'Capacity':>10} | {'Grid':>6} | {'Facing'}{C.RESET}")
+            print(f"   " + "-" * 50)
+            for site in site_details:
+                print(f"   {site['site_id']:>4} | {site['area_km2']:>12.2f} | {site['capacity_exact']:>10} | {site['grid_type']:>6} | {site['facing_direction']}")
+        else:
+            print(f"   {C.WARN}{Icon.CROSS}No valid sites met all constraints.{C.RESET}")
+
         # Print outputs generated block for log
-        print(f"\n=============================================")
-        print(f"   OUTPUTS GENERATED")
-        print(f"=============================================")
+        print(f"\n{C.HEADER}============================================={C.RESET}")
+        print(f"   {C.BOLD}OUTPUTS GENERATED{C.RESET}")
+        print(f"{C.HEADER}============================================={C.RESET}")
         for fpath in generated_files:
-            print(f"   -> {fpath}")
+            print(f"   {Icon.INFO}{fpath}")
 
         # Mark as cleanly finished so finally block knows to purge temporary arrays
         success_flag = True
@@ -1047,22 +1094,29 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             except: 
                 pass
         else:
-            print(f"\n[!] Run did not complete successfully.")
-            print(f"    Buffer files have been retained in the workspace.")
-            print(f"    Resume this exact run later using: --resume --resume_dir {os.path.abspath(run_output_dir)}")
+            print(f"\n   {C.FAIL}{Icon.CROSS}[!] Run did not complete successfully.{C.RESET}")
+            print(f"   {C.WARN}Buffer files have been retained in the workspace.{C.RESET}")
+            print(f"   {C.WARN}Resume this exact run later using:{C.RESET} --resume --resume_dir {os.path.abspath(run_output_dir)}")
             
-        print(f"\nTotal Execution Time: {time.time() - t_start_total:.2f} seconds")
-        print("Done.")
+        print(f"\n{C.OK}Total Execution Time: {time.time() - t_start_total:.2f} seconds{C.RESET}")
+        print(f"{C.BOLD}Done.{C.RESET}")
 
 # Custom Logger Interceptor
 class TeeLogger:
-    """Duplicates stream writes to both the original terminal and an attached log file."""
+    """Duplicates stream writes to both the original terminal and an attached log file.
+    Strips ANSI color codes from the log file output to maintain readability."""
     def __init__(self, terminal, log_file):
         self.terminal = terminal
         self.log_file = log_file
+        # Regex to match standard ANSI escape sequences (colors, bold, etc.)
+        self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        
     def write(self, message):
         self.terminal.write(message)
-        self.log_file.write(message)
+        # Strip colors before writing to the text log
+        clean_message = self.ansi_escape.sub('', message)
+        self.log_file.write(clean_message)
+        
     def flush(self):
         self.terminal.flush()
         self.log_file.flush()
@@ -1201,7 +1255,7 @@ if __name__ == "__main__":
     base_dir = args.output_directory_base_with_given_json
     if "output_directory_base_with_given_json" in config_params:
         base_dir = config_params["output_directory_base_with_given_json"]
-    elif "output_directory_base_with_given_json" in fallbackparams:
+    elif "output_directory_base_with_given_json" in fallback_params:
         base_dir = fallback_params["output_directory_base_with_given_json"]
 
     if args.config_path and os.path.exists(args.config_path):
@@ -1221,7 +1275,7 @@ if __name__ == "__main__":
     sys.stderr = TeeLogger(sys.stderr, log_file)
 
     # Ensure log captures initiation context
-    print(f"\n================================================================================")
+    print(f"\n{C.HEADER}================================================================================{C.RESET}")
     print(f"Execution started at: {datetime.now().isoformat()}")
     if args.config_path:
         print(f"Using config file: {os.path.abspath(args.config_path)}")
@@ -1229,7 +1283,7 @@ if __name__ == "__main__":
         print(f"No config file provided. Relying on CLI arguments and fallbacks.")
     print(f"Using fallbacks file: {os.path.abspath(fallback_path)}")
     print(f"Unified output directory initialized at: {os.path.abspath(run_output_dir)}")
-    print(f"================================================================================\n")
+    print(f"{C.HEADER}================================================================================{C.RESET}\n")
 
     # 5. Reconcile Configuration Strategy (Config > Fallback > CLI / Standard defaults)
     final_params = {}
@@ -1242,16 +1296,16 @@ if __name__ == "__main__":
             final_params[param] = config_params[param]
         elif param in fallback_params:
             final_params[param] = fallback_params[param]
-            print(f"WARNING: Parameter '{param}' not explicitly specified in config. Using fallback value: {fallback_params[param]}")
+            print(f"{C.WARN}{Icon.WARN}WARNING: Parameter '{param}' not explicitly specified in config. Using fallback value: {fallback_params[param]}{C.RESET}")
         else:
             final_params[param] = getattr(args, param)
 
     # Post-validation of absolutely required parameters to prevent early crashes during Fail-Fast
     if final_params.get('dem_path') is None:
-        print("ERROR: Critical parameter 'dem_path' must be provided via config file, fallback, or CLI.")
+        print(f"{C.FAIL}{Icon.CROSS}ERROR: Critical parameter 'dem_path' must be provided via config file, fallback, or CLI.{C.RESET}")
         sys.exit(1)
     if final_params.get('origin_lat') is None or final_params.get('origin_lon') is None:
-        print("ERROR: Critical parameters 'origin_lat' and 'origin_lon' must be provided via config file, fallback, or CLI.")
+        print(f"{C.FAIL}{Icon.CROSS}ERROR: Critical parameters 'origin_lat' and 'origin_lon' must be provided via config file, fallback, or CLI.{C.RESET}")
         sys.exit(1)
 
     # Default resume_dir to run_output_dir if resume is True and resume_dir not provided
@@ -1275,7 +1329,7 @@ if __name__ == "__main__":
             try:
                 selected_rfi = json.loads(rfi_input)
             except Exception as e:
-                print(f"WARNING: Could not parse custom rfi_zones string. Proceeding with 'none'. Error: {e}")
+                print(f"{C.WARN}{Icon.WARN}WARNING: Could not parse custom rfi_zones string. Proceeding with 'none'. Error: {e}{C.RESET}")
     elif isinstance(rfi_input, list):
         # Naturally supports custom RFI arrays loaded cleanly from the JSON config file
         selected_rfi = rfi_input
