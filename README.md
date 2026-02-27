@@ -1,4 +1,4 @@
-# GRAND Neutrino Observatory - Automated Site Search Tool
+# GRAND Automated Site Search Tool
 
 ## Overview
 
