@@ -232,15 +232,43 @@ def count_grid_capacity(mask_chunk, spacing_px, grid_type_code):
     return count
 
 # ==========================================
-#           HELPERS
+#           CORE PIPELINE HELPERS
 # ==========================================
+
+def load_dem_and_init_buffers(dem_path, temp_dir):
+    """
+    Step 1 Pipeline: Converts TIF to memory-mapped NPY for rapid random access
+    and initializes the ping-pong buffers for later morphology steps.
+    
+    Returns:
+    - elevation (ndarray): Memory mapped DEM.
+    - rows, cols (int): Array dimensions.
+    - path_A, path_B (str): Paths to the initialized boolean buffer arrays.
+    - buf_a (ndarray): Open memory map of Buffer A in write mode.
+    """
+    npy_path = dem_path.replace(".tif", ".npy")
+    if not os.path.exists(npy_path):
+        temp = tiff.imread(dem_path).astype(np.float32)
+        temp[temp < -100] = np.nan # Nullify ocean/void areas
+        np.save(npy_path, temp)
+        del temp
+    elevation = np.load(npy_path, mmap_mode='r')
+    rows, cols = elevation.shape
+    
+    path_A = os.path.join(temp_dir, "buffer_A.npy")
+    path_B = os.path.join(temp_dir, "buffer_B.npy")
+    buf_a = np.lib.format.open_memmap(path_A, mode='w+', shape=(rows, cols), dtype=bool)
+    buf_b = np.lib.format.open_memmap(path_B, mode='w+', shape=(rows, cols), dtype=bool)
+    del buf_b # Release lock immediately; only keep file on disk
+    
+    return elevation, rows, cols, path_A, path_B, buf_a
 
 def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_lon, 
                            min_alt=None, max_alt=None, min_aspect_deg=None, max_aspect_deg=None, 
                            road_map_path=None, max_road_dist_km=None, 
                            tile_size=2048):
     """
-    Memory-efficient topographic screening. Iterates over the large DEM in chunks (tiles) 
+    Step 2 Pipeline: Memory-efficient topographic screening. Iterates over the large DEM in chunks (tiles) 
     to find pixels that meet the primary geometrical criteria (slope, aspect, altitude) 
     and logistics constraints (RFI distance, road distance) prior to running ray-tracing.
     
@@ -369,18 +397,25 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
     if not candidates_list: return np.zeros((0, 3))
     return np.vstack(candidates_list)
 
+def run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, num_cores, buf_a):
+    """
+    Step 3 Pipeline: Expensive Physics computation parallelized across CPU cores.
+    Distributes batches of candidates to the ray-caster and records successful hits to the buffer map.
+    """
+    batches = np.array_split(candidates_arr, num_cores * 4)
+    results = Parallel(n_jobs=-1)(
+        delayed(check_physics_chunk)(batch, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km) 
+        for batch in tqdm(batches, desc="   Simulating", unit="batch")
+    )
+    # Reconstruct the boolean mask from returned ray-cast coordinates
+    for r_list, c_list in results:
+        buf_a[r_list, c_list] = True
+    buf_a.flush()
+
 def apply_morphology_pingpong(source_path, dest_path, shape, dtype, operation_func, structure, desc="Processing", tile_size=2048):
     """
     Applies image morphology operations (closing/opening) on a massive memory-mapped array 
     without loading the whole array into RAM. It reads from one file and writes to another ("ping-pong").
-    Used to prune out "tendrils" (narrow, unusable ridges) and fill in small gaps in the detected sites.
-    
-    Parameters:
-    - source_path, dest_path (str): File paths to the input and output .npy memmap files.
-    - shape (tuple): Dimensions of the array.
-    - dtype (type): Data type of the array elements (usually bool).
-    - operation_func (function): The SciPy morphology function to apply (e.g., binary_closing).
-    - structure (ndarray): The structuring element (kernel) dictating the pixel radius of the operation.
     """
     source = np.lib.format.open_memmap(source_path, mode='r')
     dest = np.lib.format.open_memmap(dest_path, mode='r+', shape=shape, dtype=dtype)
@@ -405,6 +440,112 @@ def apply_morphology_pingpong(source_path, dest_path, shape, dtype, operation_fu
                 dest[r:r_end, c:c_end] = processed[loc_r_start:loc_r_start + (r_end - r), loc_c_start:loc_c_start + (c_end - c)]
                 pbar.update(1)
     dest.flush()
+
+def clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km):
+    """
+    Step 4 Pipeline: Prunes spatial artifacts to ensure solid, block-like arrays.
+    Applies closing to fill gaps and opening to prune unusable tendrils.
+    """
+    close_r = int(antenna_spacing_km * 1000 / cell_size)
+    tendril_r = int((min_width_km * 0.5 * 1000) / cell_size)
+    apply_morphology_pingpong(path_A, path_B, (rows, cols), bool, binary_closing, np.ones((close_r, close_r)), desc="Closing")
+    apply_morphology_pingpong(path_B, path_A, (rows, cols), bool, binary_opening, np.ones((tendril_r, tendril_r)), desc="Pruning")
+
+def analyze_sites_and_capacity(path_A, elevation, rows, cols, cell_size, downsample_factor, search_mode, 
+                               target_antennas, min_sub_array_size, antenna_spacing_km, grid_type):
+    """
+    Step 5 Pipeline: Isolates unique sites and measures their capacity mathematically.
+    Uses SciPy labeling to find continuous regions and simulates physical grid placement.
+    
+    Returns:
+    - small_final (ndarray): Downsampled binary mask of the validated sites.
+    - labeled_viz (ndarray): Multi-integer labeled array for color coding visualizations.
+    - site_details (list): Dictionaries containing metadata about each valid site found.
+    - cumulative_capacity (int): Sum of all antennas fitting in valid sites.
+    - count (int): Total number of independent valid sites found.
+    """
+    final_map_disk = np.lib.format.open_memmap(path_A, mode='r')
+    small_map = final_map_disk[::downsample_factor, ::downsample_factor]
+    labeled, num = label(small_map) # Give unique integer IDs to disconnected array zones
+    
+    eff_cell = cell_size * downsample_factor
+    px_area_km2 = (eff_cell / 1000.0)**2
+    
+    if search_mode == 'single':
+        threshold_antennas = target_antennas
+    else:
+        threshold_antennas = min_sub_array_size
+        
+    req_pixels = int((threshold_antennas * antenna_spacing_km**2) / px_area_km2)
+    small_final = np.zeros_like(labeled, dtype=np.uint8)
+    labeled_viz = np.zeros_like(labeled, dtype=np.uint8)
+    cumulative_capacity = 0
+    site_details = []
+    count = 0
+    
+    if num > 0:
+        sizes = ndi_sum(small_map, labeled, index=np.arange(1, num+1))
+        potential_ids = np.where(sizes >= req_pixels)[0] + 1
+        valid_ids_final = []
+        
+        if len(potential_ids) > 0:
+            dy_ds, dx_ds = np.gradient(elevation[::downsample_factor, ::downsample_factor], eff_cell)
+            aspect_ds = np.degrees(np.arctan2(-dx_ds, dy_ds)) % 360
+            
+            spacing_px = int((antenna_spacing_km * 1000) / cell_size)
+            grid_code = 1 if grid_type == 'hex' else 0 
+            all_slices = find_objects(labeled)
+            
+            # Iterate through found blobs to calculate physical internal placement of DUs
+            for site_id in potential_ids:
+                loc = all_slices[site_id - 1]
+                r_start = loc[0].start * downsample_factor
+                r_stop = loc[0].stop * downsample_factor
+                c_start = loc[1].start * downsample_factor
+                c_stop = loc[1].stop * downsample_factor
+                
+                r_stop = min(r_stop, rows)
+                c_stop = min(c_stop, cols)
+                
+                mask_chunk = final_map_disk[r_start:r_stop, c_start:c_stop]
+                antennas_fit = count_grid_capacity(mask_chunk, spacing_px, grid_code)
+                
+                if antennas_fit >= threshold_antennas:
+                    valid_ids_final.append(site_id)
+                    site_mask_ds = (labeled == site_id)
+                    mean_aspect = np.mean(aspect_ds[site_mask_ds])
+                    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                    aspect_str = dirs[round(mean_aspect / 45) % 8]
+                    area_km2 = sizes[site_id-1] * px_area_km2
+                    
+                    site_details.append({
+                        "site_id": int(site_id),
+                        "area_km2": float(f"{area_km2:.2f}"),
+                        "capacity_exact": int(antennas_fit),
+                        "grid_type": grid_type,
+                        "mean_aspect_deg": float(f"{mean_aspect:.1f}"),
+                        "facing_direction": aspect_str
+                    })
+
+        site_details.sort(key=lambda x: x['capacity_exact'], reverse=True)
+        final_selection_ids = []
+        
+        if search_mode == 'distributed':
+            for site in site_details:
+                final_selection_ids.append(site['site_id'])
+                cumulative_capacity += site['capacity_exact']
+        else:
+            final_selection_ids = [s['site_id'] for s in site_details]
+
+        if len(final_selection_ids) > 0:
+            current_viz_id = 1
+            for original_id in final_selection_ids:
+                labeled_viz[labeled == original_id] = current_viz_id
+                current_viz_id += 1
+            small_final = np.isin(labeled, final_selection_ids).astype(np.uint8)
+            count = len(final_selection_ids)
+            
+    return small_final, labeled_viz, site_details, cumulative_capacity, count
 
 def create_world_file(tif_filename, top_left_lat, top_left_lon, cell_size_deg):
     """
@@ -475,6 +616,134 @@ def generate_kml_file(mask, elevation, filename, origin_lat, origin_lon, cell_si
         print(f"   -> KML saved to '{filename}'")
     except Exception as e:
         print(f"   -> WARNING: KML generation failed (Skipping KML). Error: {e}")
+
+def generate_visualizations_and_outputs(dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
+                                        origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, output_image_path, 
+                                        output_image_format, rfi_zones, search_mode, grid_type, antenna_spacing_km, 
+                                        min_altitude, max_altitude, region_name, final_params):
+    """
+    Step 6 Pipeline: Formats and exports all scientific products including geo-registered TIFs, KML models, 
+    an annotated map graphic, and a serialized JSON summary of the run parameters and results.
+    """
+    generated_files = []
+    
+    # Save TIF
+    out_tif = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".tif"
+    tiff.imwrite(out_tif, small_final)
+    generated_files.append(os.path.abspath(out_tif))
+    
+    # Save TFW
+    new_res_deg = (1.0/3600.0) * downsample_factor
+    create_world_file(out_tif, origin_lat, origin_lon, new_res_deg)
+    generated_files.append(os.path.abspath(os.path.splitext(out_tif)[0] + ".tfw"))
+    
+    # Save KML
+    if generate_kml:
+        kml_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".kml"
+        generate_kml_file(small_final, elevation, kml_name, origin_lat, origin_lon, new_res_deg)
+        generated_files.append(os.path.abspath(kml_name))
+
+    # Save Custom Visualization
+    try:
+        fig, ax = plt.subplots(figsize=(14, 12))
+        viz_ds = downsample_factor * 2 
+        elev_viz = elevation[::viz_ds, ::viz_ds]
+        mask_viz = small_final[::2, ::2] 
+        
+        mask_viz_labeled = labeled_viz[::2, ::2]
+        
+        mr = min(elev_viz.shape[0], mask_viz.shape[0])
+        mc = min(elev_viz.shape[1], mask_viz.shape[1])
+        elev_viz = elev_viz[:mr, :mc]
+        mask_viz_labeled = mask_viz_labeled[:mr, :mc]
+        
+        im = ax.imshow(elev_viz, cmap='terrain', vmin=0, vmax=6000)
+        
+        legend_handles = []
+        legend_labels = []
+
+        if count > 0:
+            cmap = plt.get_cmap('tab10') 
+            for i in range(1, count + 1): 
+                color = cmap((i - 1) % 10)
+                ax.contour((mask_viz_labeled == i), levels=[0.5], colors=[color], linewidths=2.5)
+                    
+                site_data = site_details[i - 1]
+                label_str = f"Site {site_data['site_id']}: {site_data['capacity_exact']} DUs ({site_data['area_km2']} km²)"
+                legend_handles.append(Line2D([0], [0], color=color, lw=2.5))
+                legend_labels.append(label_str)
+        
+        if rfi_zones:
+            deg_viz = (1.0/3600.0) * viz_ds
+            legend_handles.append(Line2D([0], [0], color='red', linestyle='--', lw=2))
+            legend_labels.append("RFI exclusion zone")
+            for item in rfi_zones:
+                type_tag = item[0]
+                if type_tag == 'circle':
+                    _, lat, lon, radius_km, name = item
+                    px_x = (lon - origin_lon) / deg_viz
+                    px_y = (origin_lat - lat) / deg_viz
+                    r_px = (radius_km / 111.0) / deg_viz
+                    ax.add_patch(Circle((px_x, px_y), r_px, edgecolor='red', facecolor='none', ls='--', lw=2))
+                    text = ax.text(px_x, px_y-r_px/2, name, color='red', fontsize=12, ha='center')
+                    text.set_path_effects([path_effects.Stroke(linewidth=4, foreground='white'), path_effects.Normal()])
+                elif type_tag == 'poly':
+                    _, coords, name = item
+                    verts = []
+                    for (plat, plon) in coords:
+                        px = (plon - origin_lon) / deg_viz
+                        py = (origin_lat - plat) / deg_viz
+                        verts.append((px, py))
+                    ax.add_patch(MplPolygon(verts, closed=True, edgecolor='red', facecolor='none', ls='--', lw=2))
+                    cx = sum(p[0] for p in verts)/len(verts)
+                    cy = sum(p[1] for p in verts)/len(verts)
+                    text = ax.text(cx, cy, name, color='red', fontsize=8, ha='center')
+                    text.set_path_effects([path_effects.Stroke(linewidth=4, foreground='white'), path_effects.Normal()])
+
+        deg_viz = (1.0/3600.0) * viz_ds
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda x,p: f"{origin_lon + x*deg_viz:.2f}"))
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda y,p: f"{origin_lat - y*deg_viz:.2f}"))
+        ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+        cbar = plt.colorbar(im, fraction=0.035, pad=0.04)
+        cbar.set_label('Altitude (m)', rotation=270, labelpad=15)
+        ax.set_title(f"GRAND site search | {region_name if region_name is not None else ''} {'|' if region_name is not None else ''} {search_mode.title()} mode\nFound {count} sites | Total capacity: {cumulative_capacity if search_mode=='distributed' else 'N/A'} DUs | Grid: {grid_type} | Spacing: {antenna_spacing_km} km | Altitude restriction: {min_altitude}-{max_altitude} m")
+        
+        fs = 'small' if len(legend_labels) > 8 else 'medium'
+        ax.legend(legend_handles, legend_labels, loc='upper right', fontsize=fs, framealpha=0.8)
+        
+        if output_image_path is not None:
+            img_name = output_image_path
+        else:
+            img_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+"."+output_image_format.strip('.')
+        
+        if os.path.dirname(img_name):
+            os.makedirs(os.path.dirname(img_name), exist_ok=True)
+            
+        plt.savefig(img_name, format=output_image_format.strip('.'), dpi=150, bbox_inches='tight')
+        generated_files.append(os.path.abspath(img_name))
+        print(f"   -> Map saved.")
+        
+    except Exception as e:
+        print(f"Viz Error: {e}")
+
+    # Save JSON output log
+    out_data = {
+        "timestamp": datetime.now().isoformat(),
+        "mode": search_mode,
+        "parameters": final_params,
+        "results": {
+            "total_sites": count,
+            "total_capacity": cumulative_capacity if search_mode=='distributed' else 'N/A',
+            "sites": site_details
+        }
+    }
+    json_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".json"
+    with open(json_name, "w") as f:
+        json.dump(out_data, f, indent=4)
+    generated_files.append(os.path.abspath(json_name))
+    print(f"   -> JSON saved.")
+    
+    return generated_files
 
 def print_tool_explanation():
     """Outputs a formatted explanation of the tool's capabilities and logic to the console."""
@@ -556,7 +825,7 @@ def validate_parameters(params):
         sys.exit(1)
 
 # ==========================================
-#             MAIN EXECUTION
+#             MAIN EXECUTION ORCHESTRATOR
 # ==========================================
 def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000, 
                             rfi_zones=None, origin_lat=-15.0, origin_lon=-73.0,
@@ -570,12 +839,23 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             downsample_factor=4, output_image_path=None, 
                             output_image_format='png'):
     """
-    The orchestrator function. Manages memory, coordinates chunking algorithms, runs 
-    the ray-tracer, performs physical capacity counting, and manages output generation.
+    The main orchestrator. Now decoupled from logic, it sets up the environment,
+    calls the pipeline helpers in sequence, and cleans up memory constraints.
     """
     
     # Cast safety to ensure slice logic doesn't fail if passed as float via JSON
     downsample_factor = int(downsample_factor)
+    
+    # Store explicit params for final JSON export
+    export_params = {
+        "dem": dem_path, "origin": [origin_lat, origin_lon],
+        "target": target_antennas, "spacing_km": antenna_spacing_km,
+        "min_dist_km": min_dist_km, "max_dist_km": max_dist_km,
+        "min_sub_array": min_sub_array_size,
+        "grid_type": grid_type, "road_map": road_map_path,
+        "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor,
+        "min_altitude": min_altitude, "max_altitude": max_altitude
+    }
     
     print(f"\n=============================================")
     print(f"   GRAND SITE SEARCH: RUN PARAMETERS")
@@ -613,35 +893,18 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     print(f"=============================================\n")
 
     t_start_total = time.time()
-    site_details = []
-    generated_files = []
-    count = 0
-
+    
     try:
-        # Step 1: Disk Setup. Convert TIF to memory-mapped NPY for rapid random access.
+        # Step 1: Disk Setup
         print("[1/6] Loading Map Data...")
         t0 = time.time()
-        npy_path = dem_path.replace(".tif", ".npy")
-        if not os.path.exists(npy_path):
-            temp = tiff.imread(dem_path).astype(np.float32)
-            temp[temp < -100] = np.nan # Nullify ocean/void areas
-            np.save(npy_path, temp)
-            del temp
-        elevation = np.load(npy_path, mmap_mode='r')
-        rows, cols = elevation.shape
-        print(f"      Map: {rows} x {cols} pixels")
-        
+        elevation, rows, cols, path_A, path_B, buf_a = load_dem_and_init_buffers(dem_path, temp_dir)
         est_disk_gb = (rows * cols * 2) / (1024**3) 
+        print(f"      Map: {rows} x {cols} pixels")
         print(f"      Estimated Temp Disk Usage: ~{est_disk_gb:.2f} GB")
         print(f"      Time: {time.time()-t0:.2f}s")
         
-        path_A = os.path.join(temp_dir, "buffer_A.npy")
-        path_B = os.path.join(temp_dir, "buffer_B.npy")
-        buf_a = np.lib.format.open_memmap(path_A, mode='w+', shape=(rows, cols), dtype=bool)
-        buf_b = np.lib.format.open_memmap(path_B, mode='w+', shape=(rows, cols), dtype=bool)
-        del buf_b
-
-        # Step 2: Basic Geometric and Geographic constraints filtering
+        # Step 2: Topographic Screen
         print("\n[2/6] Identifying Candidates...")
         t0 = time.time()
         candidates_arr = get_candidates_chunked(
@@ -657,251 +920,49 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             print("No candidates found.")
             return
 
-        # Step 3: Expensive Physics computation parallelized across CPU cores
+        # Step 3: Physics Simulation
         print(f"\n[3/6] Ray Tracing ({total} candidates)...")
         t0 = time.time()
-        batches = np.array_split(candidates_arr, num_cores * 4)
-        results = Parallel(n_jobs=-1)(
-            delayed(check_physics_chunk)(batch, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km) 
-            for batch in tqdm(batches, desc="   Simulating", unit="batch")
-        )
-        # Reconstruct the boolean mask from returned ray-cast coordinates
-        for r_list, c_list in results:
-            buf_a[r_list, c_list] = True
-        buf_a.flush()
-        del buf_a
+        run_ray_tracing_parallel(candidates_arr, elevation, cell_size, rows, cols, fresnel_buffer, min_dist_km, max_dist_km, num_cores, buf_a)
+        del buf_a  # Release memory map write lock to flush to disk
         print(f"      Time: {time.time()-t0:.2f}s")
 
-        # Step 4: Prune spatial artifacts to ensure solid, block-like arrays
+        # Step 4: Spatial Pruning
         print("\n[4/6] Cleaning Shapes...")
         t0 = time.time()
-        close_r = int(antenna_spacing_km * 1000 / cell_size)
-        tendril_r = int((min_width_km * 0.5 * 1000) / cell_size)
-        apply_morphology_pingpong(path_A, path_B, (rows, cols), bool, binary_closing, np.ones((close_r, close_r)), desc="Closing")
-        apply_morphology_pingpong(path_B, path_A, (rows, cols), bool, binary_opening, np.ones((tendril_r, tendril_r)), desc="Pruning")
+        clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km)
         print(f"      Time: {time.time()-t0:.2f}s")
 
-        # Step 5: Isolate unique sites and measure their capacity mathematically
+        # Step 5: Capacity Analysis
         print("\n[5/6] Final Analysis...")
         t0 = time.time()
-        final_map_disk = np.lib.format.open_memmap(path_A, mode='r')
-        small_map = final_map_disk[::downsample_factor, ::downsample_factor]
-        labeled, num = label(small_map) # Give unique integer IDs to disconnected array zones
-        
-        eff_cell = cell_size * downsample_factor
-        px_area_km2 = (eff_cell / 1000.0)**2
-        
-        if search_mode == 'single':
-            threshold_antennas = target_antennas
+        small_final, labeled_viz, site_details, cumulative_capacity, count = analyze_sites_and_capacity(
+            path_A, elevation, rows, cols, cell_size, downsample_factor, search_mode, target_antennas, min_sub_array_size, antenna_spacing_km, grid_type
+        )
+        if search_mode == 'distributed':
+            print(f"   -> Distributed: {count} sites found.")
+            print(f"   -> Total Cap: {cumulative_capacity} (Target: {target_antennas})")
         else:
-            threshold_antennas = min_sub_array_size
-            
-        req_pixels = int((threshold_antennas * antenna_spacing_km**2) / px_area_km2)
-        small_final = np.zeros_like(labeled, dtype=np.uint8)
-        cumulative_capacity = 0
-        
-        if num > 0:
-            sizes = ndi_sum(small_map, labeled, index=np.arange(1, num+1))
-            potential_ids = np.where(sizes >= req_pixels)[0] + 1
-            valid_ids_final = []
-            
-            if len(potential_ids) > 0:
-                dy_ds, dx_ds = np.gradient(elevation[::downsample_factor, ::downsample_factor], eff_cell)
-                aspect_ds = np.degrees(np.arctan2(-dx_ds, dy_ds)) % 360
-                
-                spacing_px = int((antenna_spacing_km * 1000) / cell_size)
-                grid_code = 1 if grid_type == 'hex' else 0 
-                all_slices = find_objects(labeled)
-                
-                # Iterate through found blobs to calculate physical internal placement of DUs
-                for site_id in potential_ids:
-                    loc = all_slices[site_id - 1]
-                    r_start = loc[0].start * downsample_factor
-                    r_stop = loc[0].stop * downsample_factor
-                    c_start = loc[1].start * downsample_factor
-                    c_stop = loc[1].stop * downsample_factor
-                    
-                    r_stop = min(r_stop, rows)
-                    c_stop = min(c_stop, cols)
-                    
-                    mask_chunk = final_map_disk[r_start:r_stop, c_start:c_stop]
-                    antennas_fit = count_grid_capacity(mask_chunk, spacing_px, grid_code)
-                    
-                    if antennas_fit >= threshold_antennas:
-                        valid_ids_final.append(site_id)
-                        site_mask_ds = (labeled == site_id)
-                        mean_aspect = np.mean(aspect_ds[site_mask_ds])
-                        dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-                        aspect_str = dirs[round(mean_aspect / 45) % 8]
-                        area_km2 = sizes[site_id-1] * px_area_km2
-                        
-                        site_details.append({
-                            "site_id": int(site_id),
-                            "area_km2": float(f"{area_km2:.2f}"),
-                            "capacity_exact": int(antennas_fit),
-                            "grid_type": grid_type,
-                            "mean_aspect_deg": float(f"{mean_aspect:.1f}"),
-                            "facing_direction": aspect_str
-                        })
+            print(f"   -> Single: {count} valid sites found.")
+        print(f"      Time: {time.time()-t0:.2f}s")
 
-            site_details.sort(key=lambda x: x['capacity_exact'], reverse=True)
-            final_selection_ids = []
-            
-            if search_mode == 'distributed':
-                for site in site_details:
-                    final_selection_ids.append(site['site_id'])
-                    cumulative_capacity += site['capacity_exact']
-                success = cumulative_capacity >= target_antennas
-                print(f"   -> Distributed: {len(final_selection_ids)} sites found.")
-                print(f"   -> Total Cap: {cumulative_capacity} (Target: {target_antennas})")
-            else:
-                final_selection_ids = [s['site_id'] for s in site_details]
-                success = len(final_selection_ids) > 0
-                print(f"   -> Single: {len(final_selection_ids)} valid sites found.")
-
-            if len(final_selection_ids) > 0:
-                labeled_viz = np.zeros_like(labeled, dtype=np.uint8)
-                current_viz_id = 1
-                for original_id in final_selection_ids:
-                    labeled_viz[labeled == original_id] = current_viz_id
-                    current_viz_id += 1
-                small_final = np.isin(labeled, final_selection_ids).astype(np.uint8)
-                count = len(final_selection_ids)
-
-        # Step 6: Create Outputs (Images, KML, and JSON parameters file)
+        # Step 6: Create Outputs
         print(f"\n[6/6] Saving & Visualization...")
         t0 = time.time()
+        generated_files = generate_visualizations_and_outputs(
+            dem_path, elevation, small_final, labeled_viz, site_details, count, cumulative_capacity,
+            origin_lat, origin_lon, cell_size, downsample_factor, generate_kml, output_image_path, 
+            output_image_format, rfi_zones, search_mode, grid_type, antenna_spacing_km, 
+            min_altitude, max_altitude, region_name, export_params
+        )
+        print(f"      Time Elapsed: {time.time()-t0:.2f}s")
         
-        # Save TIF
-        out_tif = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".tif"
-        tiff.imwrite(out_tif, small_final)
-        generated_files.append(os.path.abspath(out_tif))
-        
-        # Save TFW
-        new_res_deg = (1.0/3600.0) * downsample_factor
-        create_world_file(out_tif, origin_lat, origin_lon, new_res_deg)
-        generated_files.append(os.path.abspath(os.path.splitext(out_tif)[0] + ".tfw"))
-        
-        # Save KML
-        if generate_kml:
-            kml_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".kml"
-            generate_kml_file(small_final, elevation, kml_name, origin_lat, origin_lon, new_res_deg)
-            generated_files.append(os.path.abspath(kml_name))
-
-        # Save Custom Visualization
-        try:
-            fig, ax = plt.subplots(figsize=(14, 12))
-            viz_ds = downsample_factor * 2 
-            elev_viz = elevation[::viz_ds, ::viz_ds]
-            mask_viz = small_final[::2, ::2] 
-            
-            mask_viz_labeled = labeled_viz[::2, ::2]
-            
-            mr = min(elev_viz.shape[0], mask_viz.shape[0])
-            mc = min(elev_viz.shape[1], mask_viz.shape[1])
-            elev_viz = elev_viz[:mr, :mc]
-            mask_viz_labeled = mask_viz_labeled[:mr, :mc]
-            
-            im = ax.imshow(elev_viz, cmap='terrain', vmin=0, vmax=6000)
-            
-            legend_handles = []
-            legend_labels = []
-
-            if count > 0:
-                cmap = plt.get_cmap('tab10') 
-                for i in range(1, count + 1): 
-                    color = cmap((i - 1) % 10)
-                    ax.contour((mask_viz_labeled == i), levels=[0.5], colors=[color], linewidths=2.5)
-                        
-                    site_data = site_details[i - 1]
-                    label_str = f"Site {site_data['site_id']}: {site_data['capacity_exact']} DUs ({site_data['area_km2']} km²)"
-                    legend_handles.append(Line2D([0], [0], color=color, lw=2.5))
-                    legend_labels.append(label_str)
-            
-            if rfi_zones:
-                deg_viz = (1.0/3600.0) * viz_ds
-                legend_handles.append(Line2D([0], [0], color='red', linestyle='--', lw=2))
-                legend_labels.append("RFI exclusion zone")
-                for item in rfi_zones:
-                    type_tag = item[0]
-                    if type_tag == 'circle':
-                        _, lat, lon, radius_km, name = item
-                        px_x = (lon - origin_lon) / deg_viz
-                        px_y = (origin_lat - lat) / deg_viz
-                        r_px = (radius_km / 111.0) / deg_viz
-                        ax.add_patch(Circle((px_x, px_y), r_px, edgecolor='red', facecolor='none', ls='--', lw=2))
-                        text = ax.text(px_x, px_y-r_px/2, name, color='red', fontsize=12, ha='center')
-                        text.set_path_effects([path_effects.Stroke(linewidth=4, foreground='white'), path_effects.Normal()])
-                    elif type_tag == 'poly':
-                        _, coords, name = item
-                        verts = []
-                        for (plat, plon) in coords:
-                            px = (plon - origin_lon) / deg_viz
-                            py = (origin_lat - plat) / deg_viz
-                            verts.append((px, py))
-                        ax.add_patch(MplPolygon(verts, closed=True, edgecolor='red', facecolor='none', ls='--', lw=2))
-                        cx = sum(p[0] for p in verts)/len(verts)
-                        cy = sum(p[1] for p in verts)/len(verts)
-                        text = ax.text(cx, cy, name, color='red', fontsize=8, ha='center')
-                        text.set_path_effects([path_effects.Stroke(linewidth=4, foreground='white'), path_effects.Normal()])
-
-            deg_viz = (1.0/3600.0) * viz_ds
-            ax.xaxis.set_major_formatter(FuncFormatter(lambda x,p: f"{origin_lon + x*deg_viz:.2f}"))
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda y,p: f"{origin_lat - y*deg_viz:.2f}"))
-            ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-            cbar = plt.colorbar(im, fraction=0.035, pad=0.04)
-            cbar.set_label('Altitude (m)', rotation=270, labelpad=15)
-            ax.set_title(f"GRAND site search | {region_name if region_name is not None else ''} {'|' if region_name is not None else ''} {search_mode.title()} mode\nFound {count} sites | Total capacity: {cumulative_capacity if search_mode=='distributed' else 'N/A'} DUs | Grid: {grid_type} | Spacing: {antenna_spacing_km} km | Altitude restriction: {min_altitude}-{max_altitude} m")
-            
-            fs = 'small' if len(legend_labels) > 8 else 'medium'
-            ax.legend(legend_handles, legend_labels, loc='upper right', fontsize=fs, framealpha=0.8)
-            
-            if output_image_path is not None:
-                img_name = output_image_path
-            else:
-                img_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+"."+output_image_format.strip('.')
-            
-            if os.path.dirname(img_name):
-                os.makedirs(os.path.dirname(img_name), exist_ok=True)
-                
-            plt.savefig(img_name, format=output_image_format.strip('.'), dpi=150, bbox_inches='tight')
-            generated_files.append(os.path.abspath(img_name))
-            print(f"   -> Map saved.")
-            print(f"      Time Elapsed: {time.time()-t0:.2f}s")
-            
-        except Exception as e:
-            print(f"Viz Error: {e}")
-
         print(f"\n=============================================")
         print(f"   RESULTS SUMMARY")
         print(f"=============================================")
         print(f"   -> Sites Found: {count}")
         for site in site_details:
             print(f"      Site {site['site_id']}: {site['area_km2']} km² | Cap: {site['capacity_exact']} ({site['grid_type']}) | Faces: {site['facing_direction']}")
-        
-        # Save JSON output log
-        out_data = {
-            "timestamp": datetime.now().isoformat(),
-            "mode": search_mode,
-            "parameters": {
-                "dem": dem_path, "origin": [origin_lat, origin_lon],
-                "target": target_antennas, "spacing_km": antenna_spacing_km,
-                "min_dist_km": min_dist_km, "max_dist_km": max_dist_km,
-                "min_sub_array": min_sub_array_size,
-                "grid_type": grid_type, "road_map": road_map_path,
-                "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor
-            },
-            "results": {
-                "total_sites": count,
-                "total_capacity": cumulative_capacity if search_mode=='distributed' else 'N/A',
-                "sites": site_details
-            }
-        }
-        json_name = "grand_search_results_"+os.path.splitext(os.path.basename(dem_path))[0]+".json"
-        with open(json_name, "w") as f:
-            json.dump(out_data, f, indent=4)
-        generated_files.append(os.path.abspath(json_name))
-        print(f"   -> JSON saved.")
         
         # Print outputs generated block for log
         print(f"\n=============================================")
