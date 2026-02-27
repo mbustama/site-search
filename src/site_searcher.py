@@ -306,9 +306,12 @@ def get_candidates_chunked(elevation, cell_size, rfi_zones, origin_lat, origin_l
     rows, cols = elevation.shape
     candidates_list = []
     
-    # Rough approximations for translating lat/lon to pixels locally
+    # Approximations for translating lat/lon to pixels locally.
+    # Latitude degrees are roughly constant (~110.6 km). 
+    # Longitude degrees scale dynamically with the cosine of the latitude (Equatorial degree ~111.32 km).
     deg_per_px_lat = (cell_size / 1000.0) / 110.6
-    deg_per_px_lon = (cell_size / 1000.0) / 107.0
+    lon_km_per_deg = math.cos(math.radians(origin_lat)) * 111.32
+    deg_per_px_lon = (cell_size / 1000.0) / lon_km_per_deg
     
     # Load Logistics Road map if provided
     road_dist_map = None
@@ -1051,7 +1054,6 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         print(f"\nTotal Execution Time: {time.time() - t_start_total:.2f} seconds")
         print("Done.")
 
-
 # Custom Logger Interceptor
 class TeeLogger:
     """Duplicates stream writes to both the original terminal and an attached log file."""
@@ -1199,7 +1201,7 @@ if __name__ == "__main__":
     base_dir = args.output_directory_base_with_given_json
     if "output_directory_base_with_given_json" in config_params:
         base_dir = config_params["output_directory_base_with_given_json"]
-    elif "output_directory_base_with_given_json" in fallback_params:
+    elif "output_directory_base_with_given_json" in fallbackparams:
         base_dir = fallback_params["output_directory_base_with_given_json"]
 
     if args.config_path and os.path.exists(args.config_path):
