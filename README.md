@@ -1,7 +1,3 @@
-Here is the updated `README.md` with the precise surgical adjustments made to the Input Data section and the Quick-Start Guide.
-
----
-
 # GRAND Neutrino Observatory - Automated Site Search Tool
 
 ## Overview
