@@ -44,22 +44,42 @@ python generate_env.py
 conda env create -f environment.yml
 
 # Activate the environment
-conda activate site_search
+conda activate grand_site_search
 
 ```
 
 ---
 
-## 2. Obtaining Input Data (DEMs)
+## 2. Setup & Data Acquisition
 
-The script requires a **Digital Elevation Model (DEM)** in `.tif` format.
+The script requires a **Digital Elevation Model (DEM)** in `.tif` format, optimized for ~30-meter resolution models. We highly recommend using **[OpenTopography](https://opentopography.org/)** to acquire this data (e.g., SRTM or ALOS AW3D30).
 
-* **Resolution:** The script is optimized for ~30-meter resolution models.
-* **Sources:**
-* We highly recommend using **[OpenTopography](https://opentopography.org/)** to acquire the necessary DEM data. It provides easy access to high-resolution global datasets such as SRTM (Shuttle Radar Topography Mission) and ALOS AW3D30.
+### Automated Setup (Recommended)
 
+We provide a `setup.py` script that verifies your environment dependencies, automatically downloads the required DEM files for the primary target regions (Lima and Arequipa), and generates ready-to-use configuration files.
 
-* **Preparation:** Download the required regional tiles. If your target region spans multiple tiles, merge them into a single `.tif` using a GIS tool like QGIS or GDAL (`gdal_merge.py`) before running the script.
+**Step 1: Obtain an OpenTopography API Key**
+
+1. Create a free account at [OpenTopography](https://portal.opentopography.org/myopentopo).
+2. Log in and navigate to the **"myOpenTopo"** dashboard.
+3. Click on **"Request an API Key"** to generate your unique authorization token.
+
+**Step 2: Run the Setup Script**
+Pass your API key to the setup script to begin the automated download and configuration process:
+
+```bash
+python setup.py --open_topography_api_key YOUR_API_KEY_HERE
+
+```
+
+This will securely download the `.tif` files into `../input/dem/` and generate the necessary JSON config files in `../config/`.
+
+### Manual Setup
+
+If you are targeting a region other than Lima or Arequipa:
+
+* Download the required regional tiles manually via the OpenTopography web portal.
+* **Preparation:** If your target region spans multiple tiles, merge them into a single `.tif` using a GIS tool like QGIS or GDAL (`gdal_merge.py`) before running the script.
 
 ---
 
