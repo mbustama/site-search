@@ -443,15 +443,15 @@ def apply_morphology_pingpong(source_path, dest_path, shape, dtype, operation_fu
                 pbar.update(1)
     dest.flush()
 
-def clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km):
+def clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km, tile_size):
     """
     Step 4 Pipeline: Prunes spatial artifacts to ensure solid, block-like arrays.
     Applies closing to fill gaps and opening to prune unusable tendrils.
     """
     close_r = int(antenna_spacing_km * 1000 / cell_size)
     tendril_r = int((min_width_km * 0.5 * 1000) / cell_size)
-    apply_morphology_pingpong(path_A, path_B, (rows, cols), bool, binary_closing, np.ones((close_r, close_r)), desc="Closing")
-    apply_morphology_pingpong(path_B, path_A, (rows, cols), bool, binary_opening, np.ones((tendril_r, tendril_r)), desc="Pruning")
+    apply_morphology_pingpong(path_A, path_B, (rows, cols), bool, binary_closing, np.ones((close_r, close_r)), desc="Closing", tile_size=tile_size)
+    apply_morphology_pingpong(path_B, path_A, (rows, cols), bool, binary_opening, np.ones((tendril_r, tendril_r)), desc="Pruning", tile_size=tile_size)
 
 def analyze_sites_and_capacity(path_A, elevation, rows, cols, cell_size, downsample_factor, search_mode, 
                                target_antennas, min_sub_array_size, antenna_spacing_km, grid_type):
@@ -770,6 +770,7 @@ Customizable Constraints & Processing Parameters:
 - RFI Zones: Accept pre-defined sets ('lima', 'arequipa') or custom geometry lists via JSON config.
 - Fresnel Buffer: Adds a vertical clearance margin (in meters) to the line-of-sight ray.
 - Downsample Factor: Modifies the internal resolution of the capacity masking, speeding up processing.
+- Tile Size: Configures the size of memory-mapped square chunks for RAM management.
 - Unified Output Generation: Exports georeferenced TIFFs, a KML file, an annotated graphical map, 
   a JSON run-summary, and the execution log into a single dynamically named output directory.
 ================================================================================
@@ -816,6 +817,10 @@ def validate_parameters(params):
     if params['min_slope_deg'] >= params['max_slope_deg']:
         errors.append("min_slope_deg must be strictly less than max_slope_deg.")
 
+    # 7. Verify memory constraints
+    if params['tile_size'] <= 0:
+        errors.append("tile_size must be strictly positive (> 0).")
+
     # Execute Fail-Fast
     if errors:
         print("\n================================================================================")
@@ -840,7 +845,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
                             min_slope_deg=3.0, max_slope_deg=25.0,
                             region_name=None, fresnel_buffer=200.0, 
                             downsample_factor=4, run_output_dir=".", 
-                            output_image_format='png'):
+                            output_image_format='png', tile_size=2048):
     """
     The main orchestrator. Now decoupled from logic, it sets up the environment,
     calls the pipeline helpers in sequence, and cleans up memory constraints.
@@ -848,6 +853,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     
     # Cast safety to ensure slice logic doesn't fail if passed as float via JSON
     downsample_factor = int(downsample_factor)
+    tile_size = int(tile_size)
     
     # Store explicit params for final JSON export
     export_params = {
@@ -858,7 +864,8 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         "grid_type": grid_type, "road_map": road_map_path,
         "fresnel_buffer": fresnel_buffer, "downsample_factor": downsample_factor,
         "min_altitude": min_altitude, "max_altitude": max_altitude,
-        "min_slope_deg": min_slope_deg, "max_slope_deg": max_slope_deg
+        "min_slope_deg": min_slope_deg, "max_slope_deg": max_slope_deg,
+        "tile_size": tile_size
     }
     
     print(f"\n=============================================")
@@ -872,6 +879,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
     print(f"   -> Slope Range: {min_slope_deg}° to {max_slope_deg}°")
     print(f"   -> Target Dist: {min_dist_km} - {max_dist_km} km")
     print(f"   -> Physics: Fresnel Buffer {fresnel_buffer}m | Downsample Factor {downsample_factor}")
+    print(f"   -> Memory: Tile Size {tile_size}x{tile_size} px")
     if road_map_path:
         print(f"   -> Logistics: Require road within {max_road_dist_km} km")
     if min_altitude or max_altitude:
@@ -917,7 +925,8 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
             min_alt=min_altitude, max_alt=max_altitude,
             road_map_path=road_map_path, max_road_dist_km=max_road_dist_km,
             min_aspect_deg=min_aspect_deg, max_aspect_deg=max_aspect_deg,
-            min_slope_deg=min_slope_deg, max_slope_deg=max_slope_deg
+            min_slope_deg=min_slope_deg, max_slope_deg=max_slope_deg,
+            tile_size=tile_size
         )
         total = candidates_arr.shape[0]
         print(f"      Time: {time.time()-t0:.2f}s")
@@ -936,7 +945,7 @@ def find_grand_regions_interactive(dem_path, cell_size=30, target_antennas=1000,
         # Step 4: Spatial Pruning
         print("\n[4/6] Cleaning Shapes...")
         t0 = time.time()
-        clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km)
+        clean_shape_artifacts(path_A, path_B, rows, cols, cell_size, antenna_spacing_km, min_width_km, tile_size)
         print(f"      Time: {time.time()-t0:.2f}s")
 
         # Step 5: Capacity Analysis
@@ -1019,6 +1028,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_slope_deg", type=float, default=25.0, help="Maximum terrain steepness in degrees (default: 25.0).")
     parser.add_argument("--fresnel_buffer", type=float, default=200.0, help="Clearance margin (in meters) for line-of-sight ray tracing (default: 200.0).")
     parser.add_argument("--downsample_factor", type=int, default=4, help="Internal capacity mask downsampling factor for processing speed (default: 4).")
+    parser.add_argument("--tile_size", type=int, default=2048, help="Size of the square memory chunk for RAM management (default: 2048).")
     
     # Logistics and Geography Arguments
     parser.add_argument("--rfi_zones", type=str, default='none', help="Can be preset ('lima', 'arequipa') or a valid JSON string outlining custom exclusion zones.")
@@ -1066,6 +1076,7 @@ if __name__ == "__main__":
             "grid_type": "hex",
             "fresnel_buffer": 200.0,
             "downsample_factor": 4,
+            "tile_size": 2048,
             "rfi_zones": "none",
             "road_map_path": None,
             "max_road_dist_km": 20.0,
@@ -1228,5 +1239,6 @@ if __name__ == "__main__":
         fresnel_buffer=final_params['fresnel_buffer'],
         downsample_factor=final_params['downsample_factor'],
         run_output_dir=run_output_dir,
-        output_image_format=final_params['output_image_format']
+        output_image_format=final_params['output_image_format'],
+        tile_size=final_params['tile_size']
     )
