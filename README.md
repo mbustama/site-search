@@ -206,7 +206,7 @@ Parameters can be supplied in three ways. The script resolves parameters in the 
 | `--search_mode` | String | `distributed` | `single` forces one monolithic array. `distributed` allows combined sub-arrays. |
 | `--region_name` | String | `None` | Cosmetic name printed on the final visualization map. |
 | `--generate_kml` | Flag | `False` | Compiles bounding contours into a Google Earth `.kml` file. |
-| `--output_directory_base...` | String | `../output/` | Directory to store the unified run folders (containing logs, maps, and json). |
+| `--output_directory_base_with_given_json` | String | `../output/` | Directory to store the unified run folders (containing logs, maps, and json). |
 | `--output_image_format` | String | `png` | Format of the visual map (`png`, `pdf`, `svg`). |
 
 ---
